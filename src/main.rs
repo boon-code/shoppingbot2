@@ -7,14 +7,13 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use log::{debug, error, info, warn};
+use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use teloxide::{
     dispatching::UpdateFilterExt,
     prelude::*,
     types::{
-        CallbackQuery, ChatId, InlineKeyboardButton, InlineKeyboardMarkup, Message,
-        ParseMode, Update,
+        CallbackQuery, ChatId, InlineKeyboardButton, InlineKeyboardMarkup, Message, MessageId, Update
     },
     utils::command::BotCommands,
 };
@@ -74,9 +73,6 @@ enum Command {
 
     #[command(description = "Show help text")]
     Help,
-
-    #[command(description = "Show command list")]
-    Cmd,
 }
 
 #[derive(Clone, Debug)]
@@ -535,11 +531,6 @@ async fn command_handler(
             bot.send_message(chat_id, Command::descriptions().to_string())
                 .await?;
         }
-
-        Command::Cmd => {
-            bot.send_message(chat_id, Command::bot_commands().to_string())
-                .await?;
-        }
     }
 
     Ok(())
@@ -771,7 +762,7 @@ async fn callback_handler(
                         return Ok(());
                     }
 
-                    bot.answer_callback_query(query.id)
+                    bot.answer_callback_query(query.id.clone())
                         .text(format!("Swap {first_id} and {selected_id}"))
                         .await?;
 
@@ -891,7 +882,7 @@ fn init_logging(args: &Args) {
         "info"
     };
 
-    std::env::set_var("RUST_LOG", level);
+    unsafe { std::env::set_var("RUST_LOG", level); }
 
     pretty_env_logger::init();
 }
