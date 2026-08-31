@@ -1,8 +1,8 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::{Arc, atomic::{AtomicU64, Ordering}},
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
@@ -13,15 +13,12 @@ use teloxide::{
     dispatching::UpdateFilterExt,
     prelude::*,
     types::{
-        CallbackQuery, ChatId, InlineKeyboardButton, InlineKeyboardMarkup, Message, MessageId, Update
+        CallbackQuery, ChatId, InlineKeyboardButton, InlineKeyboardMarkup, Message, MessageId,
+        Update,
     },
     utils::command::BotCommands,
 };
-use tokio::{
-    fs,
-    sync::Mutex,
-    time::sleep,
-};
+use tokio::{fs, sync::Mutex, time::sleep};
 
 const ADD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const SHOP_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
@@ -29,6 +26,8 @@ const SWAP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 type SharedStore = Arc<Mutex<Store>>;
 type SharedSessions = Arc<Mutex<HashMap<i64, Session>>>;
+
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Parser, Debug)]
 #[command(name = "shoppingbot")]
@@ -153,14 +152,7 @@ impl Store {
             serde_json::from_str(&contents).context("invalid shopping list database")?;
 
         if db.next_id == 0 {
-            db.next_id = db
-                .chats
-                .values()
-                .flatten()
-                .map(|i| i.id)
-                .max()
-                .unwrap_or(0)
-                + 1;
+            db.next_id = db.chats.values().flatten().map(|i| i.id).max().unwrap_or(0) + 1;
         }
 
         Ok(Self { path, db })
@@ -169,8 +161,7 @@ impl Store {
     async fn save(&self) -> Result<()> {
         let tmp = self.path.with_extension("json.tmp");
 
-        let data =
-            serde_json::to_vec_pretty(&self.db).context("failed to serialize database")?;
+        let data = serde_json::to_vec_pretty(&self.db).context("failed to serialize database")?;
 
         fs::write(&tmp, data)
             .await
@@ -178,12 +169,7 @@ impl Store {
 
         fs::rename(&tmp, &self.path)
             .await
-            .with_context(|| {
-                format!(
-                    "failed to replace database {}",
-                    self.path.display()
-                )
-            })?;
+            .with_context(|| format!("failed to replace database {}", self.path.display()))?;
 
         Ok(())
     }
@@ -197,10 +183,7 @@ impl Store {
     }
 
     fn items_mut(&mut self, chat_id: ChatId) -> &mut Vec<Item> {
-        self.db
-            .chats
-            .entry(chat_id.0.to_string())
-            .or_default()
+        self.db.chats.entry(chat_id.0.to_string()).or_default()
     }
 
     async fn add_item(&mut self, chat_id: ChatId, text: String) -> Result<()> {
@@ -239,12 +222,7 @@ impl Store {
         Ok(Some(result))
     }
 
-    async fn swap_items(
-        &mut self,
-        chat_id: ChatId,
-        first: u64,
-        second: u64,
-    ) -> Result<()> {
+    async fn swap_items(&mut self, chat_id: ChatId, first: u64, second: u64) -> Result<()> {
         if first == second {
             return Ok(());
         }
@@ -318,11 +296,7 @@ async fn get_chat_id(message: &Message) -> Option<ChatId> {
     Some(message.chat.id)
 }
 
-async fn close_session(
-    bot: Bot,
-    sessions: SharedSessions,
-    chat_id: ChatId,
-) -> Result<()> {
+async fn close_session(bot: Bot, sessions: SharedSessions, chat_id: ChatId) -> Result<()> {
     let old = sessions.lock().await.remove(&chat_id.0);
 
     if let Some(session) = old {
@@ -410,11 +384,8 @@ async fn command_handler(
                 );
             }
 
-            bot.send_message(
-                chat_id,
-                "Please name items to put on the list:",
-            )
-            .await?;
+            bot.send_message(chat_id, "Please name items to put on the list:")
+                .await?;
 
             tokio::spawn(expire_session(
                 bot.clone(),
@@ -432,11 +403,8 @@ async fn command_handler(
             };
 
             let Some(keyboard) = keyboard else {
-                bot.send_message(
-                    chat_id,
-                    "Your shopping list is already empty",
-                )
-                .await?;
+                bot.send_message(chat_id, "Your shopping list is already empty")
+                    .await?;
 
                 return Ok(());
             };
@@ -475,11 +443,8 @@ async fn command_handler(
             };
 
             let Some(keyboard) = keyboard else {
-                bot.send_message(
-                    chat_id,
-                    "Your shopping list is already empty",
-                )
-                .await?;
+                bot.send_message(chat_id, "Your shopping list is already empty")
+                    .await?;
 
                 return Ok(());
             };
@@ -520,11 +485,8 @@ async fn command_handler(
             let mut store = store.lock().await;
             store.remove_checked(chat_id).await?;
 
-            bot.send_message(
-                chat_id,
-                "Cleaned up your shopping list",
-            )
-            .await?;
+            bot.send_message(chat_id, "Cleaned up your shopping list")
+                .await?;
         }
 
         Command::Help => {
@@ -545,11 +507,8 @@ async fn text_handler(
     let chat_id = msg.chat.id;
 
     let Some(text) = msg.text() else {
-        bot.send_message(
-            chat_id,
-            "Unsupported content type",
-        )
-        .await?;
+        bot.send_message(chat_id, "Unsupported content type")
+            .await?;
 
         return Ok(());
     };
@@ -557,10 +516,7 @@ async fn text_handler(
     let session = sessions.lock().await.get(&chat_id.0).cloned();
 
     match session {
-        Some(Session::Add {
-            count,
-            generation,
-        }) => {
+        Some(Session::Add { count, generation }) => {
             {
                 let mut store = store.lock().await;
                 store.add_item(chat_id, text.to_string()).await?;
@@ -578,11 +534,8 @@ async fn text_handler(
                 );
             }
 
-            bot.send_message(
-                chat_id,
-                format!("Added item {text}"),
-            )
-            .await?;
+            bot.send_message(chat_id, format!("Added item {text}"))
+                .await?;
         }
 
         Some(_) => {
@@ -680,18 +633,14 @@ async fn callback_handler(
                         .collect::<Vec<_>>()
                 };
 
-                let text = format!(
-                    "Shopping list done\n\n{}",
-                    checked.join("\n")
-                );
+                let text = format!("Shopping list done\n\n{}", checked.join("\n"));
 
                 {
                     let mut store = store.lock().await;
                     store.remove_checked(chat_id).await?;
                 }
 
-                bot.edit_message_text(chat_id, message_id, text)
-                    .await?;
+                bot.edit_message_text(chat_id, message_id, text).await?;
 
                 sessions.lock().await.remove(&chat_id.0);
             }
@@ -710,115 +659,111 @@ async fn callback_handler(
             message_id,
             first,
             generation,
-        }) => {
-            match first {
-                None => {
+        }) => match first {
+            None => {
+                bot.answer_callback_query(query.id)
+                    .text(format!("Select {selected_id}"))
+                    .await?;
+
+                let new_keyboard = {
+                    let store = store.lock().await;
+
+                    let rows = store
+                        .items(chat_id)
+                        .iter()
+                        .filter(|item| !item.checked && item.id != selected_id)
+                        .map(|item| {
+                            vec![InlineKeyboardButton::callback(
+                                item.item.clone(),
+                                item.id.to_string(),
+                            )]
+                        })
+                        .collect::<Vec<_>>();
+
+                    InlineKeyboardMarkup::new(rows)
+                };
+
+                bot.edit_message_reply_markup(chat_id, message_id)
+                    .reply_markup(new_keyboard)
+                    .await?;
+
+                {
+                    let mut sessions = sessions.lock().await;
+
+                    sessions.insert(
+                        chat_id.0,
+                        Session::Swap {
+                            message_id,
+                            first: Some(selected_id),
+                            generation,
+                        },
+                    );
+                }
+            }
+
+            Some(first_id) => {
+                if first_id == selected_id {
                     bot.answer_callback_query(query.id)
-                        .text(format!("Select {selected_id}"))
+                        .text("Abort swap command")
                         .await?;
 
-                    let new_keyboard = {
-                        let store = store.lock().await;
+                    return Ok(());
+                }
 
-                        let rows = store
-                            .items(chat_id)
-                            .iter()
-                            .filter(|item| !item.checked && item.id != selected_id)
-                            .map(|item| {
-                                vec![InlineKeyboardButton::callback(
-                                    item.item.clone(),
-                                    item.id.to_string(),
-                                )]
-                            })
-                            .collect::<Vec<_>>();
+                bot.answer_callback_query(query.id.clone())
+                    .text(format!("Swap {first_id} and {selected_id}"))
+                    .await?;
 
-                        InlineKeyboardMarkup::new(rows)
-                    };
+                let result = {
+                    let mut store = store.lock().await;
+                    store.swap_items(chat_id, first_id, selected_id).await
+                };
 
+                if let Err(err) = result {
+                    bot.answer_callback_query(query.id)
+                        .text("Could not swap items")
+                        .await?;
+
+                    return Err(err);
+                }
+
+                let new_keyboard = {
+                    let store = store.lock().await;
+                    keyboard(store.items(chat_id))
+                };
+
+                if let Some(new_keyboard) = new_keyboard {
                     bot.edit_message_reply_markup(chat_id, message_id)
                         .reply_markup(new_keyboard)
                         .await?;
-
-                    {
-                        let mut sessions = sessions.lock().await;
-
-                        sessions.insert(
-                            chat_id.0,
-                            Session::Swap {
-                                message_id,
-                                first: Some(selected_id),
-                                generation,
-                            },
-                        );
-                    }
-                }
-
-                Some(first_id) => {
-                    if first_id == selected_id {
-                        bot.answer_callback_query(query.id)
-                            .text("Abort swap command")
-                            .await?;
-
-                        return Ok(());
-                    }
-
-                    bot.answer_callback_query(query.id.clone())
-                        .text(format!("Swap {first_id} and {selected_id}"))
+                } else {
+                    bot.edit_message_reply_markup(chat_id, message_id)
+                        .reply_markup(InlineKeyboardMarkup::default())
                         .await?;
-
-                    let result = {
-                        let mut store = store.lock().await;
-                        store
-                            .swap_items(chat_id, first_id, selected_id)
-                            .await
-                    };
-
-                    if let Err(err) = result {
-                        bot.answer_callback_query(query.id)
-                            .text("Could not swap items")
-                            .await?;
-
-                        return Err(err);
-                    }
-
-                    let new_keyboard = {
-                        let store = store.lock().await;
-                        keyboard(store.items(chat_id))
-                    };
-
-                    if let Some(new_keyboard) = new_keyboard {
-                        bot.edit_message_reply_markup(chat_id, message_id)
-                            .reply_markup(new_keyboard)
-                            .await?;
-                    } else {
-                        bot.edit_message_reply_markup(chat_id, message_id)
-                            .reply_markup(InlineKeyboardMarkup::default())
-                            .await?;
-                    }
-
-                    {
-                        let mut sessions = sessions.lock().await;
-
-                        sessions.insert(
-                            chat_id.0,
-                            Session::Swap {
-                                message_id,
-                                first: None,
-                                generation,
-                            },
-                        );
-                    }
-
-                    tokio::spawn(expire_session(
-                        bot.clone(),
-                        sessions.clone(),
-                        chat_id,
-                        generation,
-                        SWAP_TIMEOUT,
-                    ));
                 }
+
+                {
+                    let mut sessions = sessions.lock().await;
+
+                    sessions.insert(
+                        chat_id.0,
+                        Session::Swap {
+                            message_id,
+                            first: None,
+                            generation,
+                        },
+                    );
+                }
+
+                tokio::spawn(expire_session(
+                    bot.clone(),
+                    sessions.clone(),
+                    chat_id,
+                    generation,
+                    SWAP_TIMEOUT,
+                ));
             }
-        }
+        },
 
         Some(Session::Add { .. }) => {
             bot.answer_callback_query(query.id)
@@ -837,10 +782,7 @@ async fn callback_handler(
 }
 
 fn generation() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos() as u64
+    NEXT_GENERATION.fetch_add(1, Ordering::Relaxed)
 }
 
 async fn load_token(value: &str) -> Result<String> {
@@ -882,7 +824,9 @@ fn init_logging(args: &Args) {
         "info"
     };
 
-    unsafe { std::env::set_var("RUST_LOG", level); }
+    unsafe {
+        std::env::set_var("RUST_LOG", level);
+    }
 
     pretty_env_logger::init();
 }
@@ -899,12 +843,7 @@ async fn main() -> Result<()> {
 
     let store = Store::load(&args.database)
         .await
-        .with_context(|| {
-            format!(
-                "failed to load database {}",
-                args.database.display()
-            )
-        })?;
+        .with_context(|| format!("failed to load database {}", args.database.display()))?;
 
     let store: SharedStore = Arc::new(Mutex::new(store));
     let sessions: SharedSessions = Arc::new(Mutex::new(HashMap::new()));
@@ -916,18 +855,10 @@ async fn main() -> Result<()> {
     let handler = dptree::entry()
         .branch(
             Update::filter_message()
-                .branch(
-                    teloxide::filter_command::<Command, _>()
-                        .endpoint(command_handler),
-                )
-                .branch(
-                    dptree::endpoint(text_handler),
-                ),
+                .branch(teloxide::filter_command::<Command, _>().endpoint(command_handler))
+                .branch(dptree::endpoint(text_handler)),
         )
-        .branch(
-            Update::filter_callback_query()
-                .endpoint(callback_handler),
-        );
+        .branch(Update::filter_callback_query().endpoint(callback_handler));
 
     Dispatcher::builder(bot, handler)
         .dependencies(dptree::deps![store, sessions])
