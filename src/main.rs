@@ -78,6 +78,9 @@ enum Command {
 
     #[command(description = "Show help text")]
     Help,
+
+    #[command(rename = "cmd", description = "List all supported commands")]
+    Cmd,
 }
 
 #[derive(Clone, Debug)]
@@ -342,6 +345,13 @@ fn strip_list_prefix(line: &str) -> &str {
     line
 }
 
+fn rstrip_slash<'a>(s: &'a String) -> &'a str {
+    match s.find('/') {
+        Some(idx) => &s[(idx + 1)..],
+        None => &s,
+    }
+}
+
 fn parse_import_list(text: &str) -> Vec<String> {
     text.lines()
         .map(strip_list_prefix)
@@ -570,6 +580,14 @@ async fn command_handler(
         Command::Help => {
             bot.send_message(chat_id, Command::descriptions().to_string())
                 .await?;
+        }
+
+        Command::Cmd => {
+            let cmds: Vec<_> = Command::bot_commands()
+                .iter()
+                .map(|x| format!("{} - {}", rstrip_slash(&x.command), x.description))
+                .collect();
+            bot.send_message(chat_id, cmds.join("\n")).await?;
         }
     }
 
@@ -976,6 +994,8 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use crate::rstrip_slash;
+
     use super::parse_import_list;
 
     #[test]
@@ -1000,5 +1020,12 @@ mod tests {
             parse_import_list("  - [ ] milk\n    - eggs\n  -[] bread"),
             vec!["milk", "eggs", "bread"]
         );
+    }
+
+    #[test]
+    fn rstrip_slash_test() {
+        assert_eq!("cmd", rstrip_slash(&"/cmd".to_string()));
+        assert_eq!("", rstrip_slash(&"/".to_string()));
+        assert_eq!("cmd", rstrip_slash(&"cmd".to_string()));
     }
 }
