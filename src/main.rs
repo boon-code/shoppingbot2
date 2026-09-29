@@ -319,9 +319,32 @@ fn keyboard(items: &[Item]) -> Option<InlineKeyboardMarkup> {
     }
 }
 
+fn strip_list_prefix(line: &str) -> &str {
+    let line = line.trim();
+
+    // Markdown checkbox: - [ ] , - [x], - [X]
+    if let Some(rest) = line.strip_prefix("- [") {
+        if let Some(close) = rest.find(']') {
+            return rest[close + 1..].trim_start();
+        }
+    }
+
+    // No-space checkbox: -[]
+    if let Some(rest) = line.strip_prefix("-[]") {
+        return rest.trim_start();
+    }
+
+    // Simple dash prefix: -
+    if let Some(rest) = line.strip_prefix('-') {
+        return rest.trim_start();
+    }
+
+    line
+}
+
 fn parse_import_list(text: &str) -> Vec<String> {
     text.lines()
-        .map(str::trim)
+        .map(strip_list_prefix)
         .filter(|line| !line.is_empty())
         .map(str::to_string)
         .collect()
@@ -959,6 +982,22 @@ mod tests {
     fn parses_newline_separated_items_and_ignores_blank_lines() {
         assert_eq!(
             parse_import_list("  milk \r\n\n eggs\n  bread  \n"),
+            vec!["milk", "eggs", "bread"]
+        );
+    }
+
+    #[test]
+    fn strips_list_prefixes() {
+        assert_eq!(
+            parse_import_list("- [ ] milk\n- [x] eggs\n- [X] bread\n-[] butter\n- cheese"),
+            vec!["milk", "eggs", "bread", "butter", "cheese"]
+        );
+    }
+
+    #[test]
+    fn strips_leading_spaces_before_prefix() {
+        assert_eq!(
+            parse_import_list("  - [ ] milk\n    - eggs\n  -[] bread"),
             vec!["milk", "eggs", "bread"]
         );
     }
