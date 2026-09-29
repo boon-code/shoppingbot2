@@ -1,7 +1,10 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::{Arc, atomic::{AtomicU64, Ordering}},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -58,6 +61,9 @@ enum Command {
     #[command(description = "Add multiple items to list")]
     Multiadd,
 
+    #[command(rename = "import", description = "Import newline-separated items")]
+    Import,
+
     #[command(description = "Start shopping")]
     Shop,
 
@@ -81,6 +87,10 @@ enum Session {
         generation: u64,
     },
 
+    Import {
+        generation: u64,
+    },
+
     Shop {
         message_id: MessageId,
         generation: u64,
@@ -97,6 +107,7 @@ impl Session {
     fn generation(&self) -> u64 {
         match self {
             Session::Add { generation, .. }
+            | Session::Import { generation }
             | Session::Shop { generation, .. }
             | Session::Swap { generation, .. } => *generation,
         }
@@ -107,7 +118,7 @@ impl Session {
             Session::Shop { message_id, .. } | Session::Swap { message_id, .. } => {
                 Some(*message_id)
             }
-            Session::Add { .. } => None,
+            Session::Add { .. } | Session::Import { .. } => None,
         }
     }
 }
@@ -196,6 +207,22 @@ impl Store {
             checked: false,
         });
 
+        self.save().await
+    }
+
+    async fn add_items(&mut self, chat_id: ChatId, texts: Vec<String>) -> Result<()> {
+        let mut new_items = Vec::with_capacity(texts.len());
+        for text in texts {
+            let id = self.db.next_id;
+            self.db.next_id += 1;
+            new_items.push(Item {
+                id,
+                item: text,
+                checked: false,
+            });
+        }
+
+        self.items_mut(chat_id).extend(new_items);
         self.save().await
     }
 
@@ -292,6 +319,14 @@ fn keyboard(items: &[Item]) -> Option<InlineKeyboardMarkup> {
     }
 }
 
+fn parse_import_list(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 async fn get_chat_id(message: &Message) -> Option<ChatId> {
     Some(message.chat.id)
 }
@@ -385,6 +420,26 @@ async fn command_handler(
             }
 
             bot.send_message(chat_id, "Please name items to put on the list:")
+                .await?;
+
+            tokio::spawn(expire_session(
+                bot.clone(),
+                sessions.clone(),
+                chat_id,
+                generation,
+                ADD_TIMEOUT,
+            ));
+        }
+
+        Command::Import => {
+            let generation = generation();
+
+            sessions
+                .lock()
+                .await
+                .insert(chat_id.0, Session::Import { generation });
+
+            bot.send_message(chat_id, "Send the items to import, one item per line:")
                 .await?;
 
             tokio::spawn(expire_session(
@@ -535,6 +590,26 @@ async fn text_handler(
             }
 
             bot.send_message(chat_id, format!("Added item {text}"))
+                .await?;
+        }
+
+        Some(Session::Import { .. }) => {
+            let items = parse_import_list(text);
+
+            if items.is_empty() {
+                bot.send_message(chat_id, "No items found. Send one item per line:")
+                    .await?;
+                return Ok(());
+            }
+
+            let count = items.len();
+            {
+                let mut store = store.lock().await;
+                store.add_items(chat_id, items).await?;
+            }
+            sessions.lock().await.remove(&chat_id.0);
+
+            bot.send_message(chat_id, format!("Imported {count} items"))
                 .await?;
         }
 
@@ -765,9 +840,9 @@ async fn callback_handler(
             }
         },
 
-        Some(Session::Add { .. }) => {
+        Some(Session::Add { .. } | Session::Import { .. }) => {
             bot.answer_callback_query(query.id)
-                .text("Please enter an item name")
+                .text("Please send the item list as a message")
                 .await?;
         }
 
@@ -874,4 +949,17 @@ async fn main() -> Result<()> {
         .await;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_import_list;
+
+    #[test]
+    fn parses_newline_separated_items_and_ignores_blank_lines() {
+        assert_eq!(
+            parse_import_list("  milk \r\n\n eggs\n  bread  \n"),
+            vec!["milk", "eggs", "bread"]
+        );
+    }
 }
