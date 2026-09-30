@@ -49,7 +49,7 @@ struct Args {
     #[arg(long)]
     quiet: bool,
 
-    /// Path to the persistent JSON database.
+    /// Path to the list data directory, or a legacy JSON database file to import.
     #[arg(long, default_value = "lists.json")]
     database: PathBuf,
 }
@@ -276,10 +276,9 @@ async fn command_handler(
 
     match cmd {
         Command::List => {
-            let store = store.lock().await;
-            let items = store.items(chat_id);
+            let items = store.lock().await.items(chat_id).await?;
 
-            bot.send_message(chat_id, checklist_text(items)).await?;
+            bot.send_message(chat_id, checklist_text(&items)).await?;
         }
 
         Command::Multiadd => {
@@ -330,8 +329,9 @@ async fn command_handler(
 
         Command::Shop => {
             let keyboard = {
-                let store = store.lock().await;
-                keyboard(store.items(chat_id))
+                let mut store = store.lock().await;
+                let items = store.items(chat_id).await?;
+                keyboard(&items)
             };
 
             let Some(keyboard) = keyboard else {
@@ -370,8 +370,9 @@ async fn command_handler(
 
         Command::Swap => {
             let keyboard = {
-                let store = store.lock().await;
-                keyboard(store.items(chat_id))
+                let mut store = store.lock().await;
+                let items = store.items(chat_id).await?;
+                keyboard(&items)
             };
 
             let Some(keyboard) = keyboard else {
@@ -565,16 +566,10 @@ async fn callback_handler(
                 .await?;
 
             let (new_keyboard, remaining) = {
-                let store = store.lock().await;
-
-                (
-                    keyboard(store.items(chat_id)),
-                    store
-                        .items(chat_id)
-                        .iter()
-                        .filter(|item| !item.checked)
-                        .count(),
-                )
+                let mut store = store.lock().await;
+                let items = store.items(chat_id).await?;
+                let remaining = items.iter().filter(|item| !item.checked).count();
+                (keyboard(&items), remaining)
             };
 
             if remaining > 0 {
@@ -583,10 +578,10 @@ async fn callback_handler(
                     .await?;
             } else {
                 let checked = {
-                    let store = store.lock().await;
-
+                    let mut store = store.lock().await;
                     store
                         .items(chat_id)
+                        .await?
                         .iter()
                         .filter(|item| item.checked)
                         .map(|item| format!("- {}", item.item))
@@ -626,10 +621,9 @@ async fn callback_handler(
                     .await?;
 
                 let new_keyboard = {
-                    let store = store.lock().await;
-
-                    let rows = store
-                        .items(chat_id)
+                    let mut store = store.lock().await;
+                    let items = store.items(chat_id).await?;
+                    let rows = items
                         .iter()
                         .filter(|item| !item.checked && item.id != selected_id)
                         .map(|item| {
@@ -688,8 +682,9 @@ async fn callback_handler(
                 }
 
                 let new_keyboard = {
-                    let store = store.lock().await;
-                    keyboard(store.items(chat_id))
+                    let mut store = store.lock().await;
+                    let items = store.items(chat_id).await?;
+                    keyboard(&items)
                 };
 
                 if let Some(new_keyboard) = new_keyboard {
@@ -821,7 +816,7 @@ async fn main() -> Result<()> {
         .branch(Update::filter_callback_query().endpoint(callback_handler));
 
     Dispatcher::builder(bot, handler)
-        .dependencies(dptree::deps![store, sessions])
+        .dependencies(dptree::deps![store.clone(), sessions])
         .enable_ctrlc_handler()
         .default_handler(|update| async move {
             debug!("Unhandled update: {update:?}");
@@ -832,6 +827,8 @@ async fn main() -> Result<()> {
         .build()
         .dispatch()
         .await;
+
+    store.lock().await.shutdown()?;
 
     Ok(())
 }
