@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <title>Shopping list</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --page: var(--tg-theme-bg-color, #f3f5f7);
+      --card: var(--tg-theme-section-bg-color, #fff);
+      --text: var(--tg-theme-text-color, #17212b);
+      --hint: var(--tg-theme-hint-color, #79838f);
+      --accent: var(--tg-theme-button-color, #3390ec);
+      --line: color-mix(in srgb, var(--text) 11%, transparent);
+      --safe-bottom: env(safe-area-inset-bottom, 0px);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      padding: max(16px, env(safe-area-inset-top, 0px)) 16px calc(94px + var(--safe-bottom));
+      background: var(--page);
+      color: var(--text);
+      font: 16px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      -webkit-font-smoothing: antialiased;
+    }
+    main { width: min(100%, 560px); margin: 0 auto; }
+    header { padding: 18px 4px 20px; }
+    .eyebrow {
+      margin: 0 0 5px;
+      color: var(--accent);
+      font-size: 12px;
+      font-weight: 750;
+      letter-spacing: .1em;
+      text-transform: uppercase;
+    }
+    h1 { margin: 0; font-size: clamp(28px, 8vw, 36px); line-height: 1.1; letter-spacing: -.04em; }
+    #summary { margin: 8px 0 0; color: var(--hint); font-size: 14px; }
+    #notice {
+      display: none;
+      margin: 0 0 14px;
+      padding: 12px 14px;
+      border-radius: 12px;
+      background: color-mix(in srgb, #e5484d 12%, var(--card));
+      font-size: 14px;
+    }
+    #notice.visible { display: block; }
+    #list {
+      margin: 0;
+      padding: 5px 14px;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: var(--card);
+      list-style: none;
+      box-shadow: 0 8px 24px color-mix(in srgb, var(--text) 5%, transparent);
+    }
+    .row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 46px 46px;
+      align-items: center;
+      gap: 3px;
+      min-height: 64px;
+      border-bottom: 1px solid var(--line);
+    }
+    .row:last-child { border-bottom: 0; }
+    .name {
+      min-width: 0;
+      padding: 12px 8px 12px 2px;
+      overflow-wrap: anywhere;
+      font-size: 16px;
+      font-weight: 550;
+    }
+    .checked .name { color: var(--hint); text-decoration: line-through; }
+    .move {
+      width: 44px;
+      height: 44px;
+      padding: 0;
+      border: 0;
+      border-radius: 14px;
+      background: transparent;
+      color: var(--accent);
+      font: inherit;
+      font-size: 24px;
+      cursor: pointer;
+      touch-action: manipulation;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .move:active:not(:disabled) { background: color-mix(in srgb, var(--accent) 14%, transparent); }
+    .move:disabled { color: var(--hint); opacity: .35; }
+    .move:focus-visible, #save:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    #empty {
+      display: none;
+      padding: 34px 18px;
+      border: 1px dashed var(--line);
+      border-radius: 18px;
+      color: var(--hint);
+      text-align: center;
+    }
+    #empty strong { display: block; margin-bottom: 4px; color: var(--text); font-size: 17px; }
+    #error {
+      display: none;
+      padding: 24px 16px;
+      border-radius: 16px;
+      background: var(--card);
+      color: var(--hint);
+      text-align: center;
+    }
+    #save {
+      position: fixed;
+      right: max(16px, env(safe-area-inset-right, 0px));
+      bottom: calc(16px + var(--safe-bottom));
+      left: max(16px, env(safe-area-inset-left, 0px));
+      width: min(calc(100% - 32px), 528px);
+      min-height: 54px;
+      margin: 0 auto;
+      border: 0;
+      border-radius: 16px;
+      background: var(--accent);
+      color: var(--tg-theme-button-text-color, #fff);
+      font: inherit;
+      font-size: 16px;
+      font-weight: 700;
+      cursor: pointer;
+      touch-action: manipulation;
+      box-shadow: 0 6px 18px color-mix(in srgb, var(--accent) 28%, transparent);
+    }
+    #save:disabled { opacity: .55; cursor: default; }
+    @media (prefers-reduced-motion: no-preference) {
+      .row { animation: appear .16s ease-out both; }
+      @keyframes appear { from { opacity: .55; transform: translateY(3px); } }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <p class="eyebrow">Your shared essentials</p>
+      <h1>Shopping list</h1>
+      <p id="summary">Loading your list…</p>
+    </header>
+    <div id="notice" role="alert"></div>
+    <ul id="list" aria-label="Shopping list"></ul>
+    <div id="empty"><strong>All clear</strong>Your shopping list is empty.</div>
+    <div id="error" role="status">Open the app from your bot in Telegram to load your list.</div>
+  </main>
+  <button id="save" type="button">Save order</button>
+  <script>
+    (() => {
+      const webApp = window.Telegram && window.Telegram.WebApp;
+      const listElement = document.getElementById("list");
+      const summary = document.getElementById("summary");
+      const empty = document.getElementById("empty");
+      const error = document.getElementById("error");
+      const notice = document.getElementById("notice");
+      const save = document.getElementById("save");
+      const params = new URLSearchParams(window.location.hash.slice(1));
+      let items;
+      let changed = false;
+
+      if (webApp) {
+        webApp.ready();
+        webApp.expand();
+      }
+
+      try {
+        items = JSON.parse(params.get("items"));
+        if (!Array.isArray(items) || !items.every(item =>
+          Number.isSafeInteger(item.id) && typeof item.item === "string" && typeof item.checked === "boolean"
+        )) throw new Error("Invalid shopping list");
+      } catch {
+        summary.textContent = "Your list could not be loaded";
+        error.style.display = "block";
+        save.hidden = true;
+        return;
+      }
+
+      function render() {
+        listElement.replaceChildren();
+        empty.style.display = items.length ? "none" : "block";
+        summary.textContent = `${items.length} ${items.length === 1 ? "item" : "items"} · move items with the arrows`;
+        items.forEach((item, index) => {
+          const row = document.createElement("li");
+          row.className = `row${item.checked ? " checked" : ""}`;
+          const name = document.createElement("span");
+          name.className = "name";
+          name.textContent = item.item;
+          row.append(name);
+          row.append(
+            moveButton("↑", `Move ${item.item} up`, index === 0, () => move(index, -1)),
+            moveButton("↓", `Move ${item.item} down`, index === items.length - 1, () => move(index, 1))
+          );
+          listElement.append(row);
+        });
+      }
+
+      function moveButton(label, accessibleLabel, disabled, action) {
+        const button = document.createElement("button");
+        button.className = "move";
+        button.type = "button";
+        button.textContent = label;
+        button.setAttribute("aria-label", accessibleLabel);
+        button.disabled = disabled;
+        button.addEventListener("click", action);
+        return button;
+      }
+
+      function move(index, offset) {
+        const target = index + offset;
+        if (target < 0 || target >= items.length) return;
+        [items[index], items[target]] = [items[target], items[index]];
+        changed = true;
+        save.textContent = "Save order";
+        notice.classList.remove("visible");
+        render();
+      }
+
+      save.addEventListener("click", () => {
+        if (!webApp) {
+          notice.textContent = "Open this page from your bot in Telegram to save changes.";
+          notice.classList.add("visible");
+          return;
+        }
+        if (!changed) {
+          notice.textContent = "Move an item first to change the order.";
+          notice.classList.add("visible");
+          return;
+        }
+        save.disabled = true;
+        save.textContent = "Sending…";
+        webApp.sendData(JSON.stringify({ ids: items.map(item => item.id) }));
+      });
+
+      render();
+    })();
+  </script>
+</body>
+</html>

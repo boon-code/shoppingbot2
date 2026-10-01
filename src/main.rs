@@ -52,6 +52,10 @@ struct Args {
     /// Path to the list data directory, or a legacy JSON database file to import.
     #[arg(long, default_value = "lists.json")]
     database: PathBuf,
+
+    /// HTTPS URL of the static Mini App page (for example, a GitHub Pages URL).
+    #[arg(long)]
+    web_app_url: Option<String>,
 }
 
 #[derive(Clone, Debug, BotCommands)]
@@ -59,6 +63,9 @@ struct Args {
 enum Command {
     #[command(description = "Show current shopping list")]
     List,
+
+    #[command(description = "Open the shopping list Mini App")]
+    App,
 
     #[command(description = "Add multiple items to list")]
     Multiadd,
@@ -268,6 +275,7 @@ async fn command_handler(
     cmd: Command,
     store: SharedStore,
     sessions: SharedSessions,
+    web_app_url: Option<String>,
 ) -> Result<()> {
     let chat_id = get_chat_id(&msg).await.context("message has no chat")?;
 
@@ -279,6 +287,22 @@ async fn command_handler(
             let items = store.lock().await.items(chat_id).await?;
 
             bot.send_message(chat_id, checklist_text(&items)).await?;
+        }
+
+        Command::App => {
+            let Some(web_app_url) = web_app_url else {
+                bot.send_message(
+                    chat_id,
+                    "The Mini App is not configured. Set --web-app-url to its HTTPS URL.",
+                )
+                .await?;
+                return Ok(());
+            };
+            let items = store.lock().await.items(chat_id).await?;
+            let keyboard = ui::keyboard(&web_app_url, &items)?;
+            bot.send_message(chat_id, checklist_text(&items))
+                .reply_markup(keyboard)
+                .await?;
         }
 
         Command::Multiadd => {
@@ -444,8 +468,46 @@ async fn text_handler(
     msg: Message,
     store: SharedStore,
     sessions: SharedSessions,
+    web_app_url: Option<String>,
 ) -> Result<()> {
     let chat_id = msg.chat.id;
+
+    if let Some(web_app_data) = msg.web_app_data() {
+        let ids = match ui::parse_order(&web_app_data.data) {
+            Ok(ids) => ids,
+            Err(err) => {
+                warn!("invalid Mini App order from chat {}: {err}", chat_id.0);
+                bot.send_message(
+                    chat_id,
+                    "Could not save that order. Please open the app again.",
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+
+        let update_result = store.lock().await.reorder_items(chat_id, &ids).await;
+        if let Err(err) = update_result {
+            warn!(
+                "could not apply Mini App order for chat {}: {err:#}",
+                chat_id.0
+            );
+            bot.send_message(chat_id, "Your list changed. Open the app again and retry.")
+                .await?;
+            return Ok(());
+        }
+
+        let items = store.lock().await.items(chat_id).await?;
+        let message = format!("Updated your shopping list:\n\n{}", checklist_text(&items));
+        if let Some(web_app_url) = web_app_url {
+            bot.send_message(chat_id, message)
+                .reply_markup(ui::keyboard(&web_app_url, &items)?)
+                .await?;
+        } else {
+            bot.send_message(chat_id, message).await?;
+        }
+        return Ok(());
+    }
 
     let Some(text) = msg.text() else {
         bot.send_message(chat_id, "Unsupported content type")
@@ -816,7 +878,7 @@ async fn main() -> Result<()> {
         .branch(Update::filter_callback_query().endpoint(callback_handler));
 
     Dispatcher::builder(bot, handler)
-        .dependencies(dptree::deps![store.clone(), sessions])
+        .dependencies(dptree::deps![store.clone(), sessions, args.web_app_url])
         .enable_ctrlc_handler()
         .default_handler(|update| async move {
             debug!("Unhandled update: {update:?}");
