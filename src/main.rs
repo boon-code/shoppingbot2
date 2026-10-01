@@ -28,6 +28,7 @@ mod db;
 const ADD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const SHOP_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 const SWAP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const REORDER_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 type SharedStore = Arc<Mutex<Store>>;
 type SharedSessions = Arc<Mutex<HashMap<i64, Session>>>;
@@ -75,6 +76,9 @@ enum Command {
     #[command(description = "Swap items on list")]
     Swap,
 
+    #[command(description = "Reorder items on list")]
+    Reorder,
+
     #[command(description = "Remove checked items from list")]
     Cleanup,
 
@@ -106,6 +110,11 @@ enum Session {
         first: Option<u64>,
         generation: u64,
     },
+
+    Reorder {
+        message_id: MessageId,
+        generation: u64,
+    },
 }
 
 impl Session {
@@ -114,15 +123,16 @@ impl Session {
             Session::Add { generation, .. }
             | Session::Import { generation }
             | Session::Shop { generation, .. }
-            | Session::Swap { generation, .. } => *generation,
+            | Session::Swap { generation, .. }
+            | Session::Reorder { generation, .. } => *generation,
         }
     }
 
     fn message_id(&self) -> Option<MessageId> {
         match self {
-            Session::Shop { message_id, .. } | Session::Swap { message_id, .. } => {
-                Some(*message_id)
-            }
+            Session::Shop { message_id, .. }
+            | Session::Swap { message_id, .. }
+            | Session::Reorder { message_id, .. } => Some(*message_id),
             Session::Add { .. } | Session::Import { .. } => None,
         }
     }
@@ -164,6 +174,33 @@ fn keyboard(items: &[Item]) -> Option<InlineKeyboardMarkup> {
     } else {
         Some(InlineKeyboardMarkup::new(rows))
     }
+}
+
+fn reorder_keyboard(items: &[Item]) -> InlineKeyboardMarkup {
+    let rows = items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let up = if index == 0 {
+                InlineKeyboardButton::callback("⬆️", "reorder:boundary")
+            } else {
+                InlineKeyboardButton::callback("⬆️", format!("reorder:up:{}", item.id))
+            };
+            let down = if index + 1 == items.len() {
+                InlineKeyboardButton::callback("⬇️", "reorder:boundary")
+            } else {
+                InlineKeyboardButton::callback("⬇️", format!("reorder:down:{}", item.id))
+            };
+
+            vec![
+                up,
+                down,
+                InlineKeyboardButton::callback(item.item.clone(), "reorder:item"),
+            ]
+        })
+        .collect::<Vec<Vec<_>>>();
+
+    InlineKeyboardMarkup::new(rows)
 }
 
 fn strip_list_prefix(line: &str) -> &str {
@@ -410,6 +447,42 @@ async fn command_handler(
             ));
         }
 
+        Command::Reorder => {
+            let items = {
+                let mut store = store.lock().await;
+                store.items(chat_id).await?
+            };
+
+            if items.is_empty() {
+                bot.send_message(chat_id, "Your shopping list is already empty")
+                    .await?;
+
+                return Ok(());
+            }
+
+            let sent = bot
+                .send_message(chat_id, "Move items up or down")
+                .reply_markup(reorder_keyboard(&items))
+                .await?;
+
+            let generation = generation();
+            sessions.lock().await.insert(
+                chat_id.0,
+                Session::Reorder {
+                    message_id: sent.id,
+                    generation,
+                },
+            );
+
+            tokio::spawn(expire_session(
+                bot.clone(),
+                sessions.clone(),
+                chat_id,
+                generation,
+                REORDER_TIMEOUT,
+            ));
+        }
+
         Command::Cancel => {
             // Already closed above.
         }
@@ -529,6 +602,106 @@ async fn callback_handler(
     let Some(data) = query.data.as_deref() else {
         return Ok(());
     };
+
+    if let Some(action) = data.strip_prefix("reorder:") {
+        let session = sessions.lock().await.get(&chat_id.0).cloned();
+        let Some(Session::Reorder {
+            message_id,
+            generation,
+        }) = session
+        else {
+            bot.answer_callback_query(query.id)
+                .text("This operation has expired")
+                .await?;
+            return Ok(());
+        };
+
+        if message.id() != message_id {
+            bot.answer_callback_query(query.id)
+                .text("This operation has expired")
+                .await?;
+            return Ok(());
+        }
+
+        let (up, item_id) = match action {
+            "item" => {
+                bot.answer_callback_query(query.id).await?;
+                return Ok(());
+            }
+            "boundary" => {
+                bot.answer_callback_query(query.id).await?;
+                return Ok(());
+            }
+            value => {
+                let Some((direction, id)) = value.split_once(':') else {
+                    bot.answer_callback_query(query.id)
+                        .text("Invalid item")
+                        .await?;
+                    return Ok(());
+                };
+                let up = match direction {
+                    "up" => true,
+                    "down" => false,
+                    _ => {
+                        bot.answer_callback_query(query.id)
+                            .text("Invalid item")
+                            .await?;
+                        return Ok(());
+                    }
+                };
+                let Ok(id) = id.parse::<u64>() else {
+                    bot.answer_callback_query(query.id)
+                        .text("Invalid item")
+                        .await?;
+                    return Ok(());
+                };
+                (up, id)
+            }
+        };
+
+        let movement = {
+            let mut store = store.lock().await;
+            store.move_item(chat_id, item_id, up).await?
+        };
+
+        match movement {
+            None => {
+                bot.answer_callback_query(query.id)
+                    .text("Item no longer exists")
+                    .await?;
+                return Ok(());
+            }
+            Some(false) => {
+                bot.answer_callback_query(query.id)
+                    .text(if up {
+                        "Item is already at the top"
+                    } else {
+                        "Item is already at the bottom"
+                    })
+                    .await?;
+                return Ok(());
+            }
+            Some(true) => {}
+        }
+
+        let items = {
+            let mut store = store.lock().await;
+            store.items(chat_id).await?
+        };
+        bot.answer_callback_query(query.id).await?;
+        bot.edit_message_reply_markup(chat_id, message_id)
+            .reply_markup(reorder_keyboard(&items))
+            .await?;
+
+        tokio::spawn(expire_session(
+            bot.clone(),
+            sessions.clone(),
+            chat_id,
+            generation,
+            REORDER_TIMEOUT,
+        ));
+        return Ok(());
+    }
 
     let selected_id: u64 = match data.parse() {
         Ok(id) => id,
@@ -726,6 +899,12 @@ async fn callback_handler(
                 .await?;
         }
 
+        Some(Session::Reorder { .. }) => {
+            bot.answer_callback_query(query.id)
+                .text("Please use the reorder arrows")
+                .await?;
+        }
+
         None => {
             bot.answer_callback_query(query.id)
                 .text("This operation has expired")
@@ -837,7 +1016,7 @@ async fn main() -> Result<()> {
 mod tests {
     use crate::rstrip_slash;
 
-    use super::parse_import_list;
+    use super::{Item, parse_import_list};
 
     #[test]
     fn parses_newline_separated_items_and_ignores_blank_lines() {
@@ -868,5 +1047,38 @@ mod tests {
         assert_eq!("cmd", rstrip_slash(&"/cmd".to_string()));
         assert_eq!("", rstrip_slash(&"/".to_string()));
         assert_eq!("cmd", rstrip_slash(&"cmd".to_string()));
+    }
+
+    #[test]
+    fn reorder_keyboard_has_two_controls_and_an_inert_item_button_per_row() {
+        let items = vec![
+            Item {
+                id: 1,
+                item: "milk".to_string(),
+                checked: false,
+            },
+            Item {
+                id: 2,
+                item: "eggs".to_string(),
+                checked: false,
+            },
+        ];
+
+        let keyboard = super::reorder_keyboard(&items);
+        let keyboard = serde_json::to_value(keyboard).unwrap();
+        let rows = keyboard["inline_keyboard"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].as_array().unwrap().len(), 3);
+        assert_eq!(
+            rows[0][0]["callback_data"].as_str(),
+            Some("reorder:boundary")
+        );
+        assert_eq!(rows[0][1]["callback_data"].as_str(), Some("reorder:down:1"));
+        assert_eq!(rows[0][2]["callback_data"].as_str(), Some("reorder:item"));
+        assert_eq!(rows[1][0]["callback_data"].as_str(), Some("reorder:up:2"));
+        assert_eq!(
+            rows[1][1]["callback_data"].as_str(),
+            Some("reorder:boundary")
+        );
     }
 }

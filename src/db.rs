@@ -307,6 +307,27 @@ impl Store {
         self.queue_save(chat_key, items)
     }
 
+    pub async fn move_item(&mut self, chat_id: ChatId, id: u64, up: bool) -> Result<Option<bool>> {
+        let chat_key = self.ensure_cached(chat_id).await?;
+        let entry = self.cache.get_mut(&chat_key).expect("cached list exists");
+        let items = Arc::make_mut(&mut entry.items);
+        let Some(index) = items.iter().position(|item| item.id == id) else {
+            return Ok(None);
+        };
+        let Some(target_index) = (if up {
+            index.checked_sub(1)
+        } else {
+            (index + 1 < items.len()).then_some(index + 1)
+        }) else {
+            return Ok(Some(false));
+        };
+
+        items.swap(index, target_index);
+        let items = Arc::clone(&entry.items);
+        self.queue_save(chat_key, items)?;
+        Ok(Some(true))
+    }
+
     pub async fn remove_checked(&mut self, chat_id: ChatId) -> Result<()> {
         let chat_key = self.ensure_cached(chat_id).await?;
         let entry = self.cache.get_mut(&chat_key).expect("cached list exists");
@@ -592,6 +613,53 @@ mod tests {
         assert!(!directory.join(".tmp_list_31323334.json").exists());
 
         drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn moves_items_up_and_down_and_persists_order() {
+        let directory = test_directory("reorder");
+        let chat_id = ChatId(1234);
+        let mut store = Store::load(&directory).await.unwrap();
+        store
+            .add_items(
+                chat_id,
+                vec!["milk".to_string(), "eggs".to_string(), "bread".to_string()],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(store.move_item(chat_id, 1, true).await.unwrap(), Some(false));
+        assert_eq!(store.move_item(chat_id, 3, true).await.unwrap(), Some(true));
+        assert_eq!(store.move_item(chat_id, 1, false).await.unwrap(), Some(true));
+        assert_eq!(store.move_item(chat_id, 99, false).await.unwrap(), None);
+        assert_eq!(
+            store
+                .items(chat_id)
+                .await
+                .unwrap()
+                .iter()
+                .map(|item| item.item.as_str())
+                .collect::<Vec<_>>(),
+            vec!["bread", "milk", "eggs"]
+        );
+
+        store.shutdown().unwrap();
+        drop(store);
+
+        let mut reopened = Store::load(&directory).await.unwrap();
+        assert_eq!(
+            reopened
+                .items(chat_id)
+                .await
+                .unwrap()
+                .iter()
+                .map(|item| item.item.as_str())
+                .collect::<Vec<_>>(),
+            vec!["bread", "milk", "eggs"]
+        );
+        reopened.shutdown().unwrap();
+        drop(reopened);
         fs::remove_dir_all(directory).unwrap();
     }
 
