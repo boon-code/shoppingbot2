@@ -177,7 +177,7 @@ fn keyboard(items: &[Item]) -> Option<InlineKeyboardMarkup> {
 }
 
 fn reorder_keyboard(items: &[Item]) -> InlineKeyboardMarkup {
-    let rows = items
+    let mut rows = items
         .iter()
         .enumerate()
         .map(|(index, item)| {
@@ -199,6 +199,8 @@ fn reorder_keyboard(items: &[Item]) -> InlineKeyboardMarkup {
             ]
         })
         .collect::<Vec<Vec<_>>>();
+
+    rows.push(vec![InlineKeyboardButton::callback("Done", "reorder:done")]);
 
     InlineKeyboardMarkup::new(rows)
 }
@@ -624,6 +626,16 @@ async fn callback_handler(
         }
 
         let (up, item_id) = match action {
+            "done" => {
+                bot.answer_callback_query(query.id)
+                    .text("Reordering finished")
+                    .await?;
+                bot.edit_message_reply_markup(chat_id, message_id)
+                    .reply_markup(InlineKeyboardMarkup::default())
+                    .await?;
+                sessions.lock().await.remove(&chat_id.0);
+                return Ok(());
+            }
             "item" => {
                 bot.answer_callback_query(query.id).await?;
                 return Ok(());
@@ -1067,7 +1079,7 @@ mod tests {
         let keyboard = super::reorder_keyboard(&items);
         let keyboard = serde_json::to_value(keyboard).unwrap();
         let rows = keyboard["inline_keyboard"].as_array().unwrap();
-        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].as_array().unwrap().len(), 3);
         assert_eq!(
             rows[0][0]["callback_data"].as_str(),
@@ -1080,5 +1092,7 @@ mod tests {
             rows[1][1]["callback_data"].as_str(),
             Some("reorder:boundary")
         );
+        assert_eq!(rows[2][0]["text"].as_str(), Some("Done"));
+        assert_eq!(rows[2][0]["callback_data"].as_str(), Some("reorder:done"));
     }
 }

@@ -629,9 +629,15 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(store.move_item(chat_id, 1, true).await.unwrap(), Some(false));
+        assert_eq!(
+            store.move_item(chat_id, 1, true).await.unwrap(),
+            Some(false)
+        );
         assert_eq!(store.move_item(chat_id, 3, true).await.unwrap(), Some(true));
-        assert_eq!(store.move_item(chat_id, 1, false).await.unwrap(), Some(true));
+        assert_eq!(
+            store.move_item(chat_id, 1, false).await.unwrap(),
+            Some(true)
+        );
         assert_eq!(store.move_item(chat_id, 99, false).await.unwrap(), None);
         assert_eq!(
             store
