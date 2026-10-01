@@ -307,6 +307,37 @@ impl Store {
         self.queue_save(chat_key, items)
     }
 
+    pub async fn reorder_items(&mut self, chat_id: ChatId, order: &[u64]) -> Result<()> {
+        let chat_key = self.ensure_cached(chat_id).await?;
+        let entry = self.cache.get_mut(&chat_key).expect("cached list exists");
+        let items = Arc::make_mut(&mut entry.items);
+
+        let current_ids: HashSet<_> = items.iter().map(|item| item.id).collect();
+        let requested_ids: HashSet<_> = order.iter().copied().collect();
+        if order.len() != items.len() || requested_ids.len() != order.len() || requested_ids != current_ids {
+            bail!("requested order must contain every shopping list item exactly once");
+        }
+
+        if items
+            .iter()
+            .map(|item| item.id)
+            .eq(order.iter().copied())
+        {
+            return Ok(());
+        }
+
+        let mut by_id: HashMap<_, _> = std::mem::take(items)
+            .into_iter()
+            .map(|item| (item.id, item))
+            .collect();
+        *items = order
+            .iter()
+            .map(|id| by_id.remove(id).expect("validated item id exists"))
+            .collect();
+        let items = Arc::clone(&entry.items);
+        self.queue_save(chat_key, items)
+    }
+
     pub async fn remove_checked(&mut self, chat_id: ChatId) -> Result<()> {
         let chat_key = self.ensure_cached(chat_id).await?;
         let entry = self.cache.get_mut(&chat_key).expect("cached list exists");

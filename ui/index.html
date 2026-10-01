@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <title>Shopping list</title>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --page: var(--tg-theme-bg-color, #f4f6f8);
+      --card: var(--tg-theme-section-bg-color, #fff);
+      --text: var(--tg-theme-text-color, #18212f);
+      --muted: var(--tg-theme-hint-color, #7d8795);
+      --accent: var(--tg-theme-button-color, #3287e8);
+      --accent-text: var(--tg-theme-button-text-color, #fff);
+      --line: color-mix(in srgb, var(--text) 10%, transparent);
+      --safe-bottom: env(safe-area-inset-bottom, 0px);
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      padding: max(16px, env(safe-area-inset-top, 0px)) 16px calc(20px + var(--safe-bottom));
+      background: var(--page);
+      color: var(--text);
+      font: 16px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    main { width: min(100%, 560px); margin: 0 auto; }
+    header { padding: 18px 4px 20px; }
+    .eyebrow {
+      margin: 0 0 5px;
+      color: var(--accent);
+      font-size: 12px;
+      font-weight: 750;
+      letter-spacing: .1em;
+      text-transform: uppercase;
+    }
+    h1 { margin: 0; font-size: clamp(27px, 8vw, 34px); line-height: 1.12; letter-spacing: -.04em; }
+    #summary { margin: 8px 0 0; color: var(--muted); font-size: 14px; }
+    #notice {
+      display: none;
+      margin: 0 0 14px;
+      padding: 12px 14px;
+      border-radius: 12px;
+      background: color-mix(in srgb, #e5484d 12%, var(--card));
+      color: var(--text);
+      font-size: 14px;
+    }
+    #notice.visible { display: block; }
+    #list {
+      margin: 0;
+      padding: 5px 14px;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: var(--card);
+      list-style: none;
+      box-shadow: 0 8px 24px color-mix(in srgb, var(--text) 5%, transparent);
+    }
+    .item {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 44px 44px;
+      align-items: center;
+      gap: 4px;
+      min-height: 62px;
+      border-bottom: 1px solid var(--line);
+    }
+    .item:last-child { border-bottom: 0; }
+    .label {
+      min-width: 0;
+      padding: 12px 8px 12px 2px;
+      overflow-wrap: anywhere;
+      font-size: 16px;
+      font-weight: 550;
+    }
+    .item.checked .label { color: var(--muted); text-decoration: line-through; }
+    .move {
+      display: grid;
+      width: 44px;
+      height: 44px;
+      place-items: center;
+      padding: 0;
+      border: 0;
+      border-radius: 13px;
+      background: transparent;
+      color: var(--accent);
+      font: inherit;
+      font-size: 23px;
+      cursor: pointer;
+      touch-action: manipulation;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .move:active:not(:disabled) { background: color-mix(in srgb, var(--accent) 14%, transparent); }
+    .move:disabled { color: var(--muted); opacity: .35; }
+    .move:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+    #empty {
+      display: none;
+      padding: 34px 18px;
+      border: 1px dashed var(--line);
+      border-radius: 18px;
+      color: var(--muted);
+      text-align: center;
+    }
+    #empty strong { display: block; margin-bottom: 4px; color: var(--text); font-size: 17px; }
+    #loading { padding: 28px 12px; color: var(--muted); text-align: center; }
+    footer { padding: 14px 4px 0; color: var(--muted); font-size: 12px; text-align: center; }
+    @media (prefers-reduced-motion: no-preference) {
+      .item { animation: arrive .18s ease-out both; }
+      @keyframes arrive { from { opacity: .5; transform: translateY(3px); } }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <p class="eyebrow">Your shared essentials</p>
+      <h1>Shopping list</h1>
+      <p id="summary">Loading your list…</p>
+    </header>
+    <div id="notice" role="alert"></div>
+    <div id="loading" role="status">Loading your list…</div>
+    <ul id="list" aria-label="Shopping list" hidden></ul>
+    <div id="empty"><strong>All clear</strong>Your shopping list is empty.</div>
+    <footer>Use the arrows to arrange your list</footer>
+  </main>
+  <script>
+    (() => {
+      const app = window.Telegram && window.Telegram.WebApp;
+      const initData = app ? app.initData : "";
+      const list = document.getElementById("list");
+      const loading = document.getElementById("loading");
+      const empty = document.getElementById("empty");
+      const summary = document.getElementById("summary");
+      const notice = document.getElementById("notice");
+      let items = [];
+      let busy = false;
+
+      if (app) {
+        app.ready();
+        app.expand();
+      }
+
+      function showNotice(message) {
+        notice.textContent = message;
+        notice.classList.add("visible");
+      }
+
+      function render() {
+        list.replaceChildren();
+        loading.hidden = true;
+        list.hidden = items.length === 0;
+        empty.style.display = items.length === 0 ? "block" : "none";
+        const checked = items.filter(item => item.checked).length;
+        summary.textContent = items.length
+          ? `${items.length} ${items.length === 1 ? "item" : "items"} · ${checked} checked`
+          : "Ready for your next shop";
+
+        items.forEach((item, index) => {
+          const row = document.createElement("li");
+          row.className = `item${item.checked ? " checked" : ""}`;
+
+          const label = document.createElement("span");
+          label.className = "label";
+          label.textContent = item.item;
+          row.append(label);
+
+          row.append(
+            moveButton("↑", `Move ${item.item} up`, index === 0, () => move(index, -1)),
+            moveButton("↓", `Move ${item.item} down`, index === items.length - 1, () => move(index, 1))
+          );
+          list.append(row);
+        });
+      }
+
+      function moveButton(symbol, label, disabled, action) {
+        const button = document.createElement("button");
+        button.className = "move";
+        button.type = "button";
+        button.textContent = symbol;
+        button.setAttribute("aria-label", label);
+        button.disabled = disabled || busy;
+        button.addEventListener("click", action);
+        return button;
+      }
+
+      async function request(path, options = {}) {
+        const response = await fetch(path, {
+          ...options,
+          headers: {
+            "X-Telegram-Init-Data": initData,
+            ...(options.headers || {})
+          }
+        });
+        if (!response.ok) {
+          const body = await response.json().catch(() => ({}));
+          throw new Error(body.error || "Could not load your list. Please try again.");
+        }
+        return response.json();
+      }
+
+      async function load() {
+        try {
+          items = await request("/api/items");
+          notice.classList.remove("visible");
+          render();
+        } catch (error) {
+          loading.hidden = true;
+          showNotice(error.message);
+          summary.textContent = "Your list could not be loaded";
+        }
+      }
+
+      async function move(index, offset) {
+        if (busy) return;
+        const nextIndex = index + offset;
+        if (nextIndex < 0 || nextIndex >= items.length) return;
+        const previousItems = items;
+        items = [...items];
+        [items[index], items[nextIndex]] = [items[nextIndex], items[index]];
+        busy = true;
+        render();
+        try {
+          items = await request("/api/order", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ ids: items.map(item => item.id) })
+          });
+          notice.classList.remove("visible");
+        } catch (error) {
+          items = previousItems;
+          showNotice(error.message);
+        } finally {
+          busy = false;
+          render();
+        }
+      }
+
+      if (!initData) {
+        loading.hidden = true;
+        summary.textContent = "Open this page from Telegram to continue";
+        showNotice("Please open the shopping list from the bot in Telegram.");
+      } else {
+        load();
+      }
+    })();
+  </script>
+</body>
+</html>

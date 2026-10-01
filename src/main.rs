@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    net::SocketAddr,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -17,13 +18,14 @@ use teloxide::{
     prelude::*,
     types::{
         CallbackQuery, ChatId, InlineKeyboardButton, InlineKeyboardMarkup, Message, MessageId,
-        Update,
+        Update, WebAppInfo,
     },
     utils::command::BotCommands,
 };
-use tokio::{fs, sync::Mutex, time::sleep};
+use tokio::{fs, net::TcpListener, sync::Mutex, time::sleep};
 
 mod db;
+mod ui;
 
 const ADD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const SHOP_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
@@ -52,6 +54,14 @@ struct Args {
     /// Path to the list data directory, or a legacy JSON database file to import.
     #[arg(long, default_value = "lists.json")]
     database: PathBuf,
+
+    /// Public HTTPS URL at which the Telegram Mini App is served.
+    #[arg(long)]
+    web_app_url: Option<String>,
+
+    /// Address on which to serve the Telegram Mini App.
+    #[arg(long, default_value = "0.0.0.0:8080")]
+    web_app_bind: SocketAddr,
 }
 
 #[derive(Clone, Debug, BotCommands)]
@@ -59,6 +69,9 @@ struct Args {
 enum Command {
     #[command(description = "Show current shopping list")]
     List,
+
+    #[command(description = "Open the shopping list Mini App")]
+    App,
 
     #[command(description = "Add multiple items to list")]
     Multiadd,
@@ -268,6 +281,7 @@ async fn command_handler(
     cmd: Command,
     store: SharedStore,
     sessions: SharedSessions,
+    web_app_url: Option<String>,
 ) -> Result<()> {
     let chat_id = get_chat_id(&msg).await.context("message has no chat")?;
 
@@ -279,6 +293,24 @@ async fn command_handler(
             let items = store.lock().await.items(chat_id).await?;
 
             bot.send_message(chat_id, checklist_text(&items)).await?;
+        }
+
+        Command::App => {
+            if let Some(url) = web_app_url {
+                let keyboard = InlineKeyboardMarkup::new(vec![vec![
+                    InlineKeyboardButton::web_app("Open shopping list", WebAppInfo::new(url)),
+                ]]);
+                bot.send_message(chat_id, "View and arrange your shopping list:")
+                    .reply_markup(keyboard)
+                    .await?;
+            } else {
+                bot.send_message(
+                    chat_id,
+                    "The Mini App is not configured. Start the bot with --web-app-url \
+                     https://your-domain.example/",
+                )
+                .await?;
+            }
         }
 
         Command::Multiadd => {
@@ -803,7 +835,28 @@ async fn main() -> Result<()> {
     let store: SharedStore = Arc::new(Mutex::new(store));
     let sessions: SharedSessions = Arc::new(Mutex::new(HashMap::new()));
 
-    let bot = Bot::new(token);
+    let web_app_url = args.web_app_url.clone();
+    let web_app_listener = if let Some(url) = web_app_url.as_deref() {
+        let parsed_url = url::Url::parse(url).context("invalid Mini App URL")?;
+        if parsed_url.scheme() != "https"
+            || parsed_url.host_str().is_none()
+            || parsed_url.path() != "/"
+            || parsed_url.query().is_some()
+            || parsed_url.fragment().is_some()
+        {
+            anyhow::bail!("--web-app-url must be an HTTPS origin with an optional trailing slash");
+        }
+
+        Some(
+            TcpListener::bind(args.web_app_bind)
+                .await
+                .with_context(|| format!("failed to bind Mini App server to {}", args.web_app_bind))?,
+        )
+    } else {
+        None
+    };
+
+    let bot = Bot::new(token.clone());
 
     info!("Bot initialized");
 
@@ -816,7 +869,7 @@ async fn main() -> Result<()> {
         .branch(Update::filter_callback_query().endpoint(callback_handler));
 
     Dispatcher::builder(bot, handler)
-        .dependencies(dptree::deps![store.clone(), sessions])
+        .dependencies(dptree::deps![store.clone(), sessions, web_app_url])
         .enable_ctrlc_handler()
         .default_handler(|update| async move {
             debug!("Unhandled update: {update:?}");
@@ -824,11 +877,23 @@ async fn main() -> Result<()> {
         .error_handler(LoggingErrorHandler::with_custom_text(
             "An error occurred while processing an update",
         ))
-        .build()
-        .dispatch()
-        .await;
+        .build();
+
+    let ui_result = if let Some(listener) = web_app_listener {
+        info!("Mini App server listening on {}", args.web_app_bind);
+        tokio::select! {
+            result = ui::serve(listener, store.clone(), token) => Some(result),
+            _ = dispatcher.dispatch() => None,
+        }
+    } else {
+        dispatcher.dispatch().await;
+        None
+    };
 
     store.lock().await.shutdown()?;
+    if let Some(result) = ui_result {
+        result.context("Mini App server stopped unexpectedly")?;
+    }
 
     Ok(())
 }
