@@ -177,6 +177,10 @@ fn keyboard(items: &[Item]) -> Option<InlineKeyboardMarkup> {
 }
 
 fn reorder_keyboard(items: &[Item]) -> InlineKeyboardMarkup {
+    let items = items
+        .iter()
+        .filter(|item| !item.checked)
+        .collect::<Vec<_>>();
     let mut rows = items
         .iter()
         .enumerate()
@@ -455,7 +459,7 @@ async fn command_handler(
                 store.items(chat_id).await?
             };
 
-            if items.is_empty() {
+            if !items.iter().any(|item| !item.checked) {
                 bot.send_message(chat_id, "Your shopping list is already empty")
                     .await?;
 
@@ -1071,6 +1075,11 @@ mod tests {
             },
             Item {
                 id: 2,
+                item: "checked item".to_string(),
+                checked: true,
+            },
+            Item {
+                id: 3,
                 item: "eggs".to_string(),
                 checked: false,
             },
@@ -1087,11 +1096,12 @@ mod tests {
         );
         assert_eq!(rows[0][1]["callback_data"].as_str(), Some("reorder:down:1"));
         assert_eq!(rows[0][2]["callback_data"].as_str(), Some("reorder:item"));
-        assert_eq!(rows[1][0]["callback_data"].as_str(), Some("reorder:up:2"));
+        assert_eq!(rows[1][0]["callback_data"].as_str(), Some("reorder:up:3"));
         assert_eq!(
             rows[1][1]["callback_data"].as_str(),
             Some("reorder:boundary")
         );
+        assert_eq!(rows[1][2]["text"].as_str(), Some("eggs"));
         assert_eq!(rows[2][0]["text"].as_str(), Some("Done"));
         assert_eq!(rows[2][0]["callback_data"].as_str(), Some("reorder:done"));
     }

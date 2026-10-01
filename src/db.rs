@@ -314,10 +314,16 @@ impl Store {
         let Some(index) = items.iter().position(|item| item.id == id) else {
             return Ok(None);
         };
+        if items[index].checked {
+            return Ok(None);
+        }
         let Some(target_index) = (if up {
-            index.checked_sub(1)
+            items[..index].iter().rposition(|item| !item.checked)
         } else {
-            (index + 1 < items.len()).then_some(index + 1)
+            items[index + 1..]
+                .iter()
+                .position(|item| !item.checked)
+                .map(|offset| index + 1 + offset)
         }) else {
             return Ok(Some(false));
         };
@@ -624,16 +630,23 @@ mod tests {
         store
             .add_items(
                 chat_id,
-                vec!["milk".to_string(), "eggs".to_string(), "bread".to_string()],
+                vec![
+                    "milk".to_string(),
+                    "checked item".to_string(),
+                    "eggs".to_string(),
+                    "bread".to_string(),
+                ],
             )
             .await
             .unwrap();
+        store.check_item(chat_id, 2).await.unwrap();
 
         assert_eq!(
             store.move_item(chat_id, 1, true).await.unwrap(),
             Some(false)
         );
-        assert_eq!(store.move_item(chat_id, 3, true).await.unwrap(), Some(true));
+        assert_eq!(store.move_item(chat_id, 2, true).await.unwrap(), None);
+        assert_eq!(store.move_item(chat_id, 4, true).await.unwrap(), Some(true));
         assert_eq!(
             store.move_item(chat_id, 1, false).await.unwrap(),
             Some(true)
@@ -645,10 +658,12 @@ mod tests {
                 .await
                 .unwrap()
                 .iter()
+                .filter(|item| !item.checked)
                 .map(|item| item.item.as_str())
                 .collect::<Vec<_>>(),
             vec!["bread", "milk", "eggs"]
         );
+        assert!(store.items(chat_id).await.unwrap()[1].checked);
 
         store.shutdown().unwrap();
         drop(store);
@@ -660,6 +675,7 @@ mod tests {
                 .await
                 .unwrap()
                 .iter()
+                .filter(|item| !item.checked)
                 .map(|item| item.item.as_str())
                 .collect::<Vec<_>>(),
             vec!["bread", "milk", "eggs"]
