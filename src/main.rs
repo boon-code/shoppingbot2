@@ -113,6 +113,7 @@ enum Session {
 
     Reorder {
         message_id: MessageId,
+        moving: Option<u64>,
         generation: u64,
     },
 }
@@ -199,13 +200,31 @@ fn reorder_keyboard(items: &[Item]) -> InlineKeyboardMarkup {
             vec![
                 up,
                 down,
-                InlineKeyboardButton::callback(item.item.clone(), "reorder:item"),
+                InlineKeyboardButton::callback(
+                    item.item.clone(),
+                    format!("reorder:select:{}", item.id),
+                ),
             ]
         })
         .collect::<Vec<Vec<_>>>();
 
     rows.push(vec![InlineKeyboardButton::callback("Done", "reorder:done")]);
 
+    InlineKeyboardMarkup::new(rows)
+}
+
+fn reorder_target_keyboard(items: &[Item], moving_id: u64) -> InlineKeyboardMarkup {
+    let mut rows = items
+        .iter()
+        .filter(|item| !item.checked && item.id != moving_id)
+        .map(|item| {
+            vec![InlineKeyboardButton::callback(
+                item.item.clone(),
+                format!("reorder:place:{}", item.id),
+            )]
+        })
+        .collect::<Vec<_>>();
+    rows.push(vec![InlineKeyboardButton::callback("Back", "reorder:back")]);
     InlineKeyboardMarkup::new(rows)
 }
 
@@ -476,6 +495,7 @@ async fn command_handler(
                 chat_id.0,
                 Session::Reorder {
                     message_id: sent.id,
+                    moving: None,
                     generation,
                 },
             );
@@ -613,6 +633,7 @@ async fn callback_handler(
         let session = sessions.lock().await.get(&chat_id.0).cloned();
         let Some(Session::Reorder {
             message_id,
+            moving,
             generation,
         }) = session
         else {
@@ -640,15 +661,141 @@ async fn callback_handler(
                 sessions.lock().await.remove(&chat_id.0);
                 return Ok(());
             }
-            "item" => {
+            "back" => {
+                if moving.is_none() {
+                    bot.answer_callback_query(query.id).await?;
+                    return Ok(());
+                }
+                let items = {
+                    let mut store = store.lock().await;
+                    store.items(chat_id).await?
+                };
                 bot.answer_callback_query(query.id).await?;
+                bot.edit_message_text(chat_id, message_id, "Move items up or down")
+                    .reply_markup(reorder_keyboard(&items))
+                    .await?;
+                sessions.lock().await.insert(
+                    chat_id.0,
+                    Session::Reorder {
+                        message_id,
+                        moving: None,
+                        generation,
+                    },
+                );
+                tokio::spawn(expire_session(
+                    bot.clone(),
+                    sessions.clone(),
+                    chat_id,
+                    generation,
+                    REORDER_TIMEOUT,
+                ));
                 return Ok(());
             }
             "boundary" => {
                 bot.answer_callback_query(query.id).await?;
                 return Ok(());
             }
+            value if value.starts_with("select:") => {
+                let Some(id) = value.strip_prefix("select:").and_then(|id| id.parse().ok()) else {
+                    bot.answer_callback_query(query.id)
+                        .text("Invalid item")
+                        .await?;
+                    return Ok(());
+                };
+                if moving.is_some() {
+                    bot.answer_callback_query(query.id)
+                        .text("Finish selecting an item first")
+                        .await?;
+                    return Ok(());
+                }
+                let items = {
+                    let mut store = store.lock().await;
+                    store.items(chat_id).await?
+                };
+                if !items.iter().any(|item| item.id == id && !item.checked) {
+                    bot.answer_callback_query(query.id)
+                        .text("Item no longer exists")
+                        .await?;
+                    return Ok(());
+                }
+                bot.answer_callback_query(query.id)
+                    .text("Select the item to move it below")
+                    .await?;
+                bot.edit_message_text(chat_id, message_id, "Select the item to move below")
+                    .reply_markup(reorder_target_keyboard(&items, id))
+                    .await?;
+                sessions.lock().await.insert(
+                    chat_id.0,
+                    Session::Reorder {
+                        message_id,
+                        moving: Some(id),
+                        generation,
+                    },
+                );
+                tokio::spawn(expire_session(
+                    bot.clone(),
+                    sessions.clone(),
+                    chat_id,
+                    generation,
+                    REORDER_TIMEOUT,
+                ));
+                return Ok(());
+            }
+            value if value.starts_with("place:") => {
+                let Some(id) = value.strip_prefix("place:").and_then(|id| id.parse().ok()) else {
+                    bot.answer_callback_query(query.id)
+                        .text("Invalid item")
+                        .await?;
+                    return Ok(());
+                };
+                let Some(moving_id) = moving else {
+                    bot.answer_callback_query(query.id)
+                        .text("Select an item to move first")
+                        .await?;
+                    return Ok(());
+                };
+                let movement = {
+                    let mut store = store.lock().await;
+                    store.move_item_after(chat_id, moving_id, id).await?
+                };
+                if movement.is_none() {
+                    bot.answer_callback_query(query.id)
+                        .text("Item no longer exists")
+                        .await?;
+                } else {
+                    bot.answer_callback_query(query.id).await?;
+                }
+                let items = {
+                    let mut store = store.lock().await;
+                    store.items(chat_id).await?
+                };
+                bot.edit_message_text(chat_id, message_id, "Move items up or down")
+                    .reply_markup(reorder_keyboard(&items))
+                    .await?;
+                sessions.lock().await.insert(
+                    chat_id.0,
+                    Session::Reorder {
+                        message_id,
+                        moving: None,
+                        generation,
+                    },
+                );
+                tokio::spawn(expire_session(
+                    bot.clone(),
+                    sessions.clone(),
+                    chat_id,
+                    generation,
+                    REORDER_TIMEOUT,
+                ));
+                return Ok(());
+            }
             value => {
+                if moving.is_some() {
+                    bot.answer_callback_query(query.id)
+                        .text("Select an item from the list")
+                        .await?;
+                    return Ok(());
+                }
                 let Some((direction, id)) = value.split_once(':') else {
                     bot.answer_callback_query(query.id)
                         .text("Invalid item")
@@ -1066,7 +1213,7 @@ mod tests {
     }
 
     #[test]
-    fn reorder_keyboard_has_two_controls_and_an_inert_item_button_per_row() {
+    fn reorder_keyboard_has_arrows_and_a_move_selection_button_per_row() {
         let items = vec![
             Item {
                 id: 1,
@@ -1095,7 +1242,10 @@ mod tests {
             Some("reorder:boundary")
         );
         assert_eq!(rows[0][1]["callback_data"].as_str(), Some("reorder:down:1"));
-        assert_eq!(rows[0][2]["callback_data"].as_str(), Some("reorder:item"));
+        assert_eq!(
+            rows[0][2]["callback_data"].as_str(),
+            Some("reorder:select:1")
+        );
         assert_eq!(rows[1][0]["callback_data"].as_str(), Some("reorder:up:3"));
         assert_eq!(
             rows[1][1]["callback_data"].as_str(),
@@ -1104,5 +1254,37 @@ mod tests {
         assert_eq!(rows[1][2]["text"].as_str(), Some("eggs"));
         assert_eq!(rows[2][0]["text"].as_str(), Some("Done"));
         assert_eq!(rows[2][0]["callback_data"].as_str(), Some("reorder:done"));
+    }
+
+    #[test]
+    fn reorder_target_keyboard_lists_other_unchecked_items_and_back() {
+        let items = vec![
+            Item {
+                id: 1,
+                item: "milk".to_string(),
+                checked: false,
+            },
+            Item {
+                id: 2,
+                item: "checked item".to_string(),
+                checked: true,
+            },
+            Item {
+                id: 3,
+                item: "eggs".to_string(),
+                checked: false,
+            },
+        ];
+        let keyboard = serde_json::to_value(super::reorder_target_keyboard(&items, 1)).unwrap();
+        let rows = keyboard["inline_keyboard"].as_array().unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0]["text"].as_str(), Some("eggs"));
+        assert_eq!(
+            rows[0][0]["callback_data"].as_str(),
+            Some("reorder:place:3")
+        );
+        assert_eq!(rows[1][0]["text"].as_str(), Some("Back"));
+        assert_eq!(rows[1][0]["callback_data"].as_str(), Some("reorder:back"));
     }
 }

@@ -334,6 +334,67 @@ impl Store {
         Ok(Some(true))
     }
 
+    pub async fn move_item_after(
+        &mut self,
+        chat_id: ChatId,
+        id: u64,
+        target_id: u64,
+    ) -> Result<Option<bool>> {
+        if id == target_id {
+            return Ok(Some(false));
+        }
+
+        let chat_key = self.ensure_cached(chat_id).await?;
+        let entry = self.cache.get_mut(&chat_key).expect("cached list exists");
+        let items = Arc::make_mut(&mut entry.items);
+        let Some(source_index) = items.iter().position(|item| item.id == id) else {
+            return Ok(None);
+        };
+        let Some(target_index) = items.iter().position(|item| item.id == target_id) else {
+            return Ok(None);
+        };
+        if items[source_index].checked || items[target_index].checked {
+            return Ok(None);
+        }
+
+        let unchecked_indices = items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| (!item.checked).then_some(index))
+            .collect::<Vec<_>>();
+        let mut unchecked_items = unchecked_indices
+            .iter()
+            .map(|&index| items[index].clone())
+            .collect::<Vec<_>>();
+        let source_position = unchecked_items
+            .iter()
+            .position(|item| item.id == id)
+            .expect("source item is unchecked");
+        let target_position = unchecked_items
+            .iter()
+            .position(|item| item.id == target_id)
+            .expect("target item is unchecked");
+
+        if source_position == target_position + 1 {
+            return Ok(Some(false));
+        }
+
+        let moving = unchecked_items.remove(source_position);
+        let target_position = unchecked_items
+            .iter()
+            .position(|item| item.id == target_id)
+            .expect("target item remains in the list");
+        unchecked_items.insert(target_position + 1, moving);
+
+        for (index, item) in unchecked_indices.into_iter().zip(unchecked_items) {
+            items[index] = item;
+        }
+
+        let items = Arc::clone(&entry.items);
+        self.queue_save(chat_key, items)?;
+        Ok(Some(true))
+    }
+
     pub async fn remove_checked(&mut self, chat_id: ChatId) -> Result<()> {
         let chat_key = self.ensure_cached(chat_id).await?;
         let entry = self.cache.get_mut(&chat_key).expect("cached list exists");
@@ -682,6 +743,55 @@ mod tests {
         );
         reopened.shutdown().unwrap();
         drop(reopened);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn moves_an_item_after_another_without_moving_checked_items() {
+        let directory = test_directory("move-after");
+        let chat_id = ChatId(1234);
+        let mut store = Store::load(&directory).await.unwrap();
+        store
+            .add_items(
+                chat_id,
+                vec![
+                    "milk".to_string(),
+                    "checked item".to_string(),
+                    "eggs".to_string(),
+                    "bread".to_string(),
+                ],
+            )
+            .await
+            .unwrap();
+        store.check_item(chat_id, 2).await.unwrap();
+
+        assert_eq!(
+            store.move_item_after(chat_id, 4, 1).await.unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            store.move_item_after(chat_id, 4, 1).await.unwrap(),
+            Some(false)
+        );
+        assert_eq!(store.move_item_after(chat_id, 99, 1).await.unwrap(), None);
+        assert_eq!(
+            store
+                .items(chat_id)
+                .await
+                .unwrap()
+                .iter()
+                .map(|item| (item.item.as_str(), item.checked))
+                .collect::<Vec<_>>(),
+            vec![
+                ("milk", false),
+                ("checked item", true),
+                ("bread", false),
+                ("eggs", false)
+            ]
+        );
+
+        store.shutdown().unwrap();
+        drop(store);
         fs::remove_dir_all(directory).unwrap();
     }
 
