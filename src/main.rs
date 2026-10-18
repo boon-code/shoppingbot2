@@ -29,6 +29,7 @@ const ADD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const SHOP_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 const SWAP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const REORDER_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const REVIVE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 type SharedStore = Arc<Mutex<Store>>;
 type SharedSessions = Arc<Mutex<HashMap<i64, Session>>>;
@@ -69,6 +70,9 @@ enum Command {
 
     #[command(description = "Start shopping")]
     Shop,
+
+    #[command(description = "Uncheck items on your shopping list")]
+    Revive,
 
     #[command(description = "Cancel current operation")]
     Cancel,
@@ -116,6 +120,11 @@ enum Session {
         moving: Option<u64>,
         generation: u64,
     },
+
+    Revive {
+        message_id: MessageId,
+        generation: u64,
+    },
 }
 
 impl Session {
@@ -125,7 +134,8 @@ impl Session {
             | Session::Import { generation }
             | Session::Shop { generation, .. }
             | Session::Swap { generation, .. }
-            | Session::Reorder { generation, .. } => *generation,
+            | Session::Reorder { generation, .. }
+            | Session::Revive { generation, .. } => *generation,
         }
     }
 
@@ -133,7 +143,8 @@ impl Session {
         match self {
             Session::Shop { message_id, .. }
             | Session::Swap { message_id, .. }
-            | Session::Reorder { message_id, .. } => Some(*message_id),
+            | Session::Reorder { message_id, .. }
+            | Session::Revive { message_id, .. } => Some(*message_id),
             Session::Add { .. } | Session::Import { .. } => None,
         }
     }
@@ -175,6 +186,25 @@ fn keyboard(items: &[Item]) -> Option<InlineKeyboardMarkup> {
     } else {
         Some(InlineKeyboardMarkup::new(rows))
     }
+}
+
+fn revive_keyboard(items: &[Item]) -> Option<InlineKeyboardMarkup> {
+    let mut rows = items
+        .iter()
+        .filter(|item| item.checked)
+        .map(|item| {
+            vec![InlineKeyboardButton::callback(
+                item.item.clone(),
+                format!("revive:{}", item.id),
+            )]
+        })
+        .collect::<Vec<_>>();
+
+    if rows.is_empty() {
+        return None;
+    }
+    rows.push(vec![InlineKeyboardButton::callback("DONE", "revive:done")]);
+    Some(InlineKeyboardMarkup::new(rows))
 }
 
 fn reorder_keyboard(items: &[Item]) -> InlineKeyboardMarkup {
@@ -430,6 +460,38 @@ async fn command_handler(
             ));
         }
 
+        Command::Revive => {
+            let items = {
+                let mut store = store.lock().await;
+                store.items(chat_id).await?
+            };
+            let Some(revive_keyboard) = revive_keyboard(&items) else {
+                bot.send_message(chat_id, "There are no checked items to revive")
+                    .await?;
+                return Ok(());
+            };
+
+            let sent = bot
+                .send_message(chat_id, "Select checked items to uncheck")
+                .reply_markup(revive_keyboard)
+                .await?;
+            let generation = generation();
+            sessions.lock().await.insert(
+                chat_id.0,
+                Session::Revive {
+                    message_id: sent.id,
+                    generation,
+                },
+            );
+            tokio::spawn(expire_session(
+                bot.clone(),
+                sessions.clone(),
+                chat_id,
+                generation,
+                REVIVE_TIMEOUT,
+            ));
+        }
+
         Command::Swap => {
             let keyboard = {
                 let mut store = store.lock().await;
@@ -628,6 +690,82 @@ async fn callback_handler(
     let Some(data) = query.data.as_deref() else {
         return Ok(());
     };
+
+    if let Some(action) = data.strip_prefix("revive:") {
+        let session = sessions.lock().await.get(&chat_id.0).cloned();
+        let Some(Session::Revive {
+            message_id,
+            generation,
+        }) = session
+        else {
+            bot.answer_callback_query(query.id)
+                .text("This operation has expired")
+                .await?;
+            return Ok(());
+        };
+        if message.id() != message_id {
+            bot.answer_callback_query(query.id)
+                .text("This operation has expired")
+                .await?;
+            return Ok(());
+        }
+
+        if action == "done" {
+            bot.answer_callback_query(query.id)
+                .text("Reviving finished")
+                .await?;
+            bot.edit_message_reply_markup(chat_id, message_id)
+                .reply_markup(InlineKeyboardMarkup::default())
+                .await?;
+            sessions.lock().await.remove(&chat_id.0);
+            return Ok(());
+        }
+
+        let Ok(selected_id) = action.parse::<u64>() else {
+            bot.answer_callback_query(query.id)
+                .text("Invalid item")
+                .await?;
+            return Ok(());
+        };
+        let item = {
+            let mut store = store.lock().await;
+            store.uncheck_item(chat_id, selected_id).await?
+        };
+        match item {
+            Some(item) => {
+                bot.answer_callback_query(query.id)
+                    .text(format!("Unchecked {}", item.item))
+                    .await?;
+            }
+            None => {
+                bot.answer_callback_query(query.id)
+                    .text("Item is no longer checked")
+                    .await?;
+            }
+        }
+
+        let items = {
+            let mut store = store.lock().await;
+            store.items(chat_id).await?
+        };
+        if let Some(revive_keyboard) = revive_keyboard(&items) {
+            bot.edit_message_reply_markup(chat_id, message_id)
+                .reply_markup(revive_keyboard)
+                .await?;
+            tokio::spawn(expire_session(
+                bot.clone(),
+                sessions.clone(),
+                chat_id,
+                generation,
+                REVIVE_TIMEOUT,
+            ));
+        } else {
+            bot.edit_message_text(chat_id, message_id, "No checked items left to revive")
+                .await?;
+            sessions.lock().await.remove(&chat_id.0);
+        }
+        return Ok(());
+    }
 
     if let Some(action) = data.strip_prefix("reorder:") {
         let session = sessions.lock().await.get(&chat_id.0).cloned();
@@ -1076,6 +1214,12 @@ async fn callback_handler(
                 .await?;
         }
 
+        Some(Session::Revive { .. }) => {
+            bot.answer_callback_query(query.id)
+                .text("Please select a checked item")
+                .await?;
+        }
+
         None => {
             bot.answer_callback_query(query.id)
                 .text("This operation has expired")
@@ -1294,5 +1438,30 @@ mod tests {
         );
         assert_eq!(rows[1][0]["text"].as_str(), Some("Back"));
         assert_eq!(rows[1][0]["callback_data"].as_str(), Some("reorder:back"));
+    }
+
+    #[test]
+    fn revive_keyboard_lists_checked_items_and_a_done_button() {
+        let items = vec![
+            Item {
+                id: 1,
+                item: "milk".to_string(),
+                checked: false,
+            },
+            Item {
+                id: 2,
+                item: "eggs".to_string(),
+                checked: true,
+            },
+        ];
+        let keyboard = serde_json::to_value(super::revive_keyboard(&items).unwrap()).unwrap();
+        let rows = keyboard["inline_keyboard"].as_array().unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0]["text"].as_str(), Some("eggs"));
+        assert_eq!(rows[0][0]["callback_data"].as_str(), Some("revive:2"));
+        assert_eq!(rows[1][0]["text"].as_str(), Some("DONE"));
+        assert_eq!(rows[1][0]["callback_data"].as_str(), Some("revive:done"));
+        assert!(super::revive_keyboard(&items[..1]).is_none());
     }
 }

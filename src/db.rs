@@ -281,6 +281,23 @@ impl Store {
         Ok(Some(result))
     }
 
+    pub async fn uncheck_item(&mut self, chat_id: ChatId, id: u64) -> Result<Option<Item>> {
+        let chat_key = self.ensure_cached(chat_id).await?;
+        let entry = self.cache.get_mut(&chat_key).expect("cached list exists");
+        let Some(item) = Arc::make_mut(&mut entry.items)
+            .iter_mut()
+            .find(|item| item.id == id && item.checked)
+        else {
+            return Ok(None);
+        };
+
+        item.checked = false;
+        let result = item.clone();
+        let items = Arc::clone(&entry.items);
+        self.queue_save(chat_key, items)?;
+        Ok(Some(result))
+    }
+
     pub async fn swap_items(&mut self, chat_id: ChatId, first: u64, second: u64) -> Result<()> {
         if first == second {
             return Ok(());
@@ -789,6 +806,27 @@ mod tests {
                 ("eggs", false)
             ]
         );
+
+        store.shutdown().unwrap();
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unchecks_an_item_and_persists_the_change() {
+        let directory = test_directory("revive");
+        let chat_id = ChatId(1234);
+        let mut store = Store::load(&directory).await.unwrap();
+        store.add_item(chat_id, "milk".to_string()).await.unwrap();
+
+        assert!(store.uncheck_item(chat_id, 1).await.unwrap().is_none());
+        store.check_item(chat_id, 1).await.unwrap();
+        assert_eq!(
+            store.uncheck_item(chat_id, 1).await.unwrap().unwrap().item,
+            "milk"
+        );
+        assert!(store.uncheck_item(chat_id, 1).await.unwrap().is_none());
+        assert!(!store.items(chat_id).await.unwrap()[0].checked);
 
         store.shutdown().unwrap();
         drop(store);
