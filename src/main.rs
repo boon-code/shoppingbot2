@@ -141,6 +141,7 @@ enum Session {
 enum CategoryMode {
     Choose,
     CreateName,
+    SetPriority(String),
     Edit(String),
     Add {
         category: String,
@@ -240,6 +241,10 @@ fn categories_keyboard(categories: &[Category]) -> InlineKeyboardMarkup {
                 InlineKeyboardButton::callback(
                     format!("{} ({})", category.name, category.items.len()),
                     format!("category:open:{index}"),
+                ),
+                InlineKeyboardButton::callback(
+                    format!("⭐ {}", category.priority),
+                    format!("category:priority:{index}"),
                 ),
                 InlineKeyboardButton::callback("🗑", format!("category:delete:{index}")),
             ]
@@ -864,6 +869,23 @@ async fn text_handler(
             ));
         }
 
+        Some(Session::Category {
+            message_id,
+            generation,
+            mode: CategoryMode::SetPriority(category_name),
+        }) => {
+            let Ok(priority) = text.trim().parse::<i32>() else {
+                bot.send_message(chat_id, "Please send a whole number for the priority:")
+                    .await?;
+                return Ok(());
+            };
+            store
+                .lock()
+                .await
+                .set_category_priority(chat_id, &category_name, priority)?;
+            show_categories(&bot, &store, &sessions, chat_id, message_id, generation).await?;
+        }
+
         Some(Session::Category { .. }) => {
             warn!(
                 "ignoring text message while category editor is active: {}",
@@ -1047,6 +1069,35 @@ async fn category_callback(
                 CategoryMode::Edit(category.name.clone()),
                 category_editor_text(&category),
                 category_editor_keyboard(&category),
+            )
+            .await?;
+        }
+        action if action.starts_with("priority:") && matches!(mode, CategoryMode::Choose) => {
+            let index = action
+                .strip_prefix("priority:")
+                .and_then(|value| value.parse::<usize>().ok());
+            let categories = store.lock().await.categories(chat_id)?;
+            let Some(category) = index.and_then(|index| categories.get(index)) else {
+                bot.answer_callback_query(query_id)
+                    .text("Category no longer exists")
+                    .await?;
+                return Ok(());
+            };
+            let category_name = category.name.clone();
+            let priority = category.priority;
+            bot.answer_callback_query(query_id).await?;
+            set_category_view(
+                &bot,
+                &sessions,
+                chat_id,
+                message_id,
+                generation,
+                CategoryMode::SetPriority(category_name.clone()),
+                format!("Send a whole-number priority for {category_name} (currently {priority}):"),
+                InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
+                    "Cancel",
+                    "category:back",
+                )]]),
             )
             .await?;
         }

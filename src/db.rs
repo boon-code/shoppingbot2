@@ -42,6 +42,8 @@ struct HistoryEntry {
 pub struct Category {
     pub name: String,
     pub items: Vec<String>,
+    #[serde(default)]
+    pub priority: i32,
 }
 
 struct CacheEntry {
@@ -264,7 +266,11 @@ impl Store {
             .into_iter()
             .flatten()
             .collect();
-        categories.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+        categories.sort_by(|left, right| {
+            left.priority
+                .cmp(&right.priority)
+                .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+        });
         Ok(categories)
     }
 
@@ -294,9 +300,21 @@ impl Store {
         let category = Category {
             name: name.to_string(),
             items: Vec::new(),
+            priority: 0,
         };
         write_category(&self.path, chat_id, &category)?;
         Ok(category)
+    }
+
+    pub fn set_category_priority(
+        &self,
+        chat_id: ChatId,
+        category_name: &str,
+        priority: i32,
+    ) -> Result<()> {
+        let mut category = self.category(chat_id, category_name)?;
+        category.priority = priority;
+        write_category(&self.path, chat_id, &category)
     }
 
     pub fn add_category_item(
@@ -1078,10 +1096,17 @@ mod tests {
                 .is_err()
         );
         store.create_category(second_chat, "Produce").unwrap();
+        assert_eq!(store.categories(first_chat).unwrap()[0].priority, 0);
+        store
+            .set_category_priority(first_chat, "Produce", 7)
+            .unwrap();
 
         let categories = store.categories(first_chat).unwrap();
         assert_eq!(categories.len(), 2);
+        assert_eq!(categories[0].name, "Pantry");
+        assert_eq!(categories[0].priority, 0);
         assert_eq!(categories[1].items, vec!["tomaten"]);
+        assert_eq!(categories[1].priority, 7);
         assert!(
             directory
                 .join("categories_31323334")
@@ -1101,7 +1126,24 @@ mod tests {
 
         store.shutdown().unwrap();
         drop(store);
+
+        let reopened = Store::load(&directory).await.unwrap();
+        let category = reopened
+            .categories(first_chat)
+            .unwrap()
+            .into_iter()
+            .find(|category| category.name == "Produce")
+            .unwrap();
+        assert_eq!(category.priority, 7);
+        drop(reopened);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn category_priority_defaults_to_zero_for_existing_files() {
+        let category: Category =
+            serde_json::from_str(r#"{"name":"Produce","items":["tomaten"]}"#).unwrap();
+        assert_eq!(category.priority, 0);
     }
 
     #[tokio::test]
