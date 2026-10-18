@@ -38,6 +38,12 @@ struct HistoryEntry {
     count: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Category {
+    pub name: String,
+    pub items: Vec<String>,
+}
+
 struct CacheEntry {
     items: Arc<Vec<Item>>,
     next_id: u64,
@@ -227,6 +233,155 @@ impl Store {
         Ok(Arc::clone(&self.cache[&chat_id].items))
     }
 
+    pub fn categories(&self, chat_id: ChatId) -> Result<Vec<Category>> {
+        let directory = self
+            .path
+            .join(categories_directory_name(&chat_id.0.to_string()));
+        if !directory.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut categories: Vec<Category> = fs::read_dir(&directory)
+            .with_context(|| format!("failed to read {}", directory.display()))?
+            .map(|entry| {
+                let entry =
+                    entry.with_context(|| format!("failed to read {}", directory.display()))?;
+                let path = entry.path();
+                if !path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("category_") && name.ends_with(".json"))
+                {
+                    return Ok(None);
+                }
+                let contents = fs::read(&path)
+                    .with_context(|| format!("failed to read {}", path.display()))?;
+                serde_json::from_slice(&contents)
+                    .with_context(|| format!("invalid category {}", path.display()))
+                    .map(Some)
+            })
+            .collect::<Result<Vec<Option<Category>>>>()?
+            .into_iter()
+            .flatten()
+            .collect();
+        categories.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+        Ok(categories)
+    }
+
+    pub async fn history_items(&mut self, chat_id: ChatId) -> Result<Vec<(String, u64)>> {
+        self.load_history(chat_id).await?;
+        let mut items = self.history[&chat_id.0.to_string()]
+            .iter()
+            .map(|entry| (entry.text.clone(), entry.count))
+            .collect::<Vec<_>>();
+        items.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+        Ok(items)
+    }
+
+    pub fn create_category(&self, chat_id: ChatId, name: &str) -> Result<Category> {
+        let name = name.trim();
+        if name.is_empty() {
+            bail!("category name cannot be empty");
+        }
+        if self
+            .categories(chat_id)?
+            .iter()
+            .any(|category| category.name.to_lowercase() == name.to_lowercase())
+        {
+            bail!("category already exists");
+        }
+
+        let category = Category {
+            name: name.to_string(),
+            items: Vec::new(),
+        };
+        write_category(&self.path, chat_id, &category)?;
+        Ok(category)
+    }
+
+    pub fn add_category_item(
+        &self,
+        chat_id: ChatId,
+        category_name: &str,
+        item: &str,
+    ) -> Result<()> {
+        if self.categories(chat_id)?.iter().any(|category| {
+            category.name != category_name && category.items.iter().any(|existing| existing == item)
+        }) {
+            bail!("item is already assigned to another category");
+        }
+        let mut category = self.category(chat_id, category_name)?;
+        if !category.items.iter().any(|existing| existing == item) {
+            category.items.push(item.to_string());
+            category.items.sort();
+            write_category(&self.path, chat_id, &category)?;
+        }
+        Ok(())
+    }
+
+    pub fn remove_category_item(
+        &self,
+        chat_id: ChatId,
+        category_name: &str,
+        item: &str,
+    ) -> Result<()> {
+        let mut category = self.category(chat_id, category_name)?;
+        if let Some(index) = category.items.iter().position(|existing| existing == item) {
+            category.items.remove(index);
+            write_category(&self.path, chat_id, &category)?;
+        }
+        Ok(())
+    }
+
+    pub fn delete_category(&self, chat_id: ChatId, category_name: &str) -> Result<()> {
+        let category = self.category(chat_id, category_name)?;
+        let path = self
+            .path
+            .join(categories_directory_name(&chat_id.0.to_string()));
+        let file = path.join(category_file_name(&category.name));
+        fs::remove_file(&file).with_context(|| format!("failed to remove {}", file.display()))?;
+        sync_directory(&path)
+    }
+
+    fn category(&self, chat_id: ChatId, category_name: &str) -> Result<Category> {
+        self.categories(chat_id)?
+            .into_iter()
+            .find(|category| category.name == category_name)
+            .with_context(|| format!("category {category_name:?} does not exist"))
+    }
+
+    async fn load_history(&mut self, chat_id: ChatId) -> Result<()> {
+        let chat_key = chat_id.0.to_string();
+        if self.history.contains_key(&chat_key) {
+            return Ok(());
+        }
+
+        let file_path = self.path.join(history_file_name(&chat_key));
+        let history = match async_fs::read_to_string(&file_path).await {
+            Ok(contents) => contents
+                .lines()
+                .enumerate()
+                .filter(|(_, line)| !line.trim().is_empty())
+                .map(|(index, line)| {
+                    serde_json::from_str(line).with_context(|| {
+                        format!(
+                            "invalid history entry at line {} in {}",
+                            index + 1,
+                            file_path.display()
+                        )
+                    })
+                })
+                .collect::<Result<Vec<HistoryEntry>>>()?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to read {}", file_path.display()));
+            }
+        };
+        self.history.insert(chat_key, history);
+        Ok(())
+    }
+
     pub async fn add_item(&mut self, chat_id: ChatId, text: String) -> Result<()> {
         let chat_key = self.ensure_cached(chat_id).await?;
         let entry = self.cache.get_mut(&chat_key).expect("cached list exists");
@@ -271,31 +426,7 @@ impl Store {
     }
 
     async fn track_history(&mut self, chat_id: &str, texts: &[String]) -> Result<()> {
-        if !self.history.contains_key(chat_id) {
-            let file_path = self.path.join(history_file_name(chat_id));
-            let history = match async_fs::read_to_string(&file_path).await {
-                Ok(contents) => contents
-                    .lines()
-                    .enumerate()
-                    .filter(|(_, line)| !line.trim().is_empty())
-                    .map(|(index, line)| {
-                        serde_json::from_str(line).with_context(|| {
-                            format!(
-                                "invalid history entry at line {} in {}",
-                                index + 1,
-                                file_path.display()
-                            )
-                        })
-                    })
-                    .collect::<Result<Vec<HistoryEntry>>>()?,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-                Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("failed to read {}", file_path.display()));
-                }
-            };
-            self.history.insert(chat_id.to_string(), history);
-        }
+        self.load_history(ChatId(chat_id.parse()?)).await?;
 
         let mut updated_history = self.history[chat_id].clone();
         for text in texts {
@@ -525,12 +656,50 @@ fn history_file_name(chat_id: &str) -> String {
     format!("history_{}", hex_encode(chat_id))
 }
 
+fn categories_directory_name(chat_id: &str) -> String {
+    format!("categories_{}", hex_encode(chat_id))
+}
+
+fn category_file_name(name: &str) -> String {
+    format!("category_{}.json", hex_encode(&name.to_lowercase()))
+}
+
 fn hex_encode(value: &str) -> String {
     value
         .as_bytes()
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+fn write_category(directory: &Path, chat_id: ChatId, category: &Category) -> Result<()> {
+    let directory = directory.join(categories_directory_name(&chat_id.0.to_string()));
+    fs::create_dir_all(&directory)
+        .with_context(|| format!("failed to create {}", directory.display()))?;
+    let file_name = category_file_name(&category.name);
+    let destination = directory.join(&file_name);
+    let temporary = directory.join(format!(".tmp_{file_name}"));
+    let data =
+        serde_json::to_vec_pretty(category).context("failed to serialize shopping category")?;
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temporary)
+        .with_context(|| format!("failed to create {}", temporary.display()))?;
+    file.write_all(&data)
+        .and_then(|()| file.sync_all())
+        .with_context(|| format!("failed to sync {}", temporary.display()))?;
+    drop(file);
+    fs::rename(&temporary, &destination).with_context(|| {
+        format!(
+            "failed to replace category {} with {}",
+            destination.display(),
+            temporary.display()
+        )
+    })?;
+    sync_directory(&directory)
 }
 
 fn normalize_history_text(text: &str) -> String {
@@ -892,6 +1061,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persists_categories_per_chat_and_prevents_duplicate_assignments() {
+        let directory = test_directory("categories");
+        let mut store = Store::load(&directory).await.unwrap();
+        let first_chat = ChatId(1234);
+        let second_chat = ChatId(1235);
+
+        store.create_category(first_chat, "Produce").unwrap();
+        store
+            .add_category_item(first_chat, "Produce", "tomaten")
+            .unwrap();
+        store.create_category(first_chat, "Pantry").unwrap();
+        assert!(
+            store
+                .add_category_item(first_chat, "Pantry", "tomaten")
+                .is_err()
+        );
+        store.create_category(second_chat, "Produce").unwrap();
+
+        let categories = store.categories(first_chat).unwrap();
+        assert_eq!(categories.len(), 2);
+        assert_eq!(categories[1].items, vec!["tomaten"]);
+        assert!(
+            directory
+                .join("categories_31323334")
+                .join("category_70726f64756365.json")
+                .exists()
+        );
+        assert_eq!(store.categories(second_chat).unwrap().len(), 1);
+
+        store
+            .remove_category_item(first_chat, "Produce", "tomaten")
+            .unwrap();
+        store.delete_category(first_chat, "Pantry").unwrap();
+        assert_eq!(
+            store.categories(first_chat).unwrap()[0].items,
+            Vec::<String>::new()
+        );
+
+        store.shutdown().unwrap();
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
     async fn tracks_normalized_history_per_chat() {
         let directory = test_directory("history");
         let chat_id = ChatId(1234);
@@ -905,6 +1118,8 @@ mod tests {
                     "1x pkg Tomaten".to_string(),
                     "500g Tomaten".to_string(),
                     "3 Tomaten".to_string(),
+                    "Kartoffeln".to_string(),
+                    "Kartoffeln".to_string(),
                 ],
             )
             .await
@@ -922,10 +1137,16 @@ mod tests {
             .collect();
         assert_eq!(
             entries,
-            vec![HistoryEntry {
-                text: "tomaten".to_string(),
-                count: 4,
-            }]
+            vec![
+                HistoryEntry {
+                    text: "tomaten".to_string(),
+                    count: 4,
+                },
+                HistoryEntry {
+                    text: "kartoffeln".to_string(),
+                    count: 2,
+                },
+            ]
         );
 
         let other_chat: Vec<HistoryEntry> = fs::read_to_string(directory.join("history_31323335"))
@@ -934,6 +1155,11 @@ mod tests {
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
         assert_eq!(other_chat[0].count, 1);
+        let frequency = store.history_items(chat_id).await.unwrap();
+        assert_eq!(
+            frequency,
+            vec![("tomaten".to_string(), 4), ("kartoffeln".to_string(), 2)]
+        );
 
         drop(store);
 
@@ -944,10 +1170,13 @@ mod tests {
             .unwrap();
         reopened.shutdown().unwrap();
         drop(reopened);
-        let persisted: HistoryEntry =
-            serde_json::from_str(&fs::read_to_string(directory.join("history_31323334")).unwrap())
-                .unwrap();
-        assert_eq!(persisted.count, 5);
+        let persisted: Vec<HistoryEntry> = fs::read_to_string(directory.join("history_31323334"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(persisted[0].count, 5);
+        assert_eq!(persisted[1].count, 2);
 
         fs::remove_dir_all(directory).unwrap();
     }

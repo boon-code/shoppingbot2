@@ -10,7 +10,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use db::{Item, Store};
+use db::{Category, Item, Store};
 use log::{debug, info, warn};
 use teloxide::{
     dispatching::UpdateFilterExt,
@@ -30,6 +30,7 @@ const SHOP_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 const SWAP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const REORDER_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const REVIVE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const CATEGORY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 type SharedStore = Arc<Mutex<Store>>;
 type SharedSessions = Arc<Mutex<HashMap<i64, Session>>>;
@@ -86,6 +87,9 @@ enum Command {
     #[command(description = "Remove checked items from list")]
     Cleanup,
 
+    #[command(description = "Edit item categories")]
+    Category,
+
     #[command(description = "Show help text")]
     Help,
 
@@ -125,6 +129,24 @@ enum Session {
         message_id: MessageId,
         generation: u64,
     },
+
+    Category {
+        message_id: MessageId,
+        generation: u64,
+        mode: CategoryMode,
+    },
+}
+
+#[derive(Clone, Debug)]
+enum CategoryMode {
+    Choose,
+    CreateName,
+    Edit(String),
+    Add {
+        category: String,
+        candidates: Vec<String>,
+    },
+    ConfirmDelete(String),
 }
 
 impl Session {
@@ -135,7 +157,8 @@ impl Session {
             | Session::Shop { generation, .. }
             | Session::Swap { generation, .. }
             | Session::Reorder { generation, .. }
-            | Session::Revive { generation, .. } => *generation,
+            | Session::Revive { generation, .. }
+            | Session::Category { generation, .. } => *generation,
         }
     }
 
@@ -144,7 +167,8 @@ impl Session {
             Session::Shop { message_id, .. }
             | Session::Swap { message_id, .. }
             | Session::Reorder { message_id, .. }
-            | Session::Revive { message_id, .. } => Some(*message_id),
+            | Session::Revive { message_id, .. }
+            | Session::Category { message_id, .. } => Some(*message_id),
             Session::Add { .. } | Session::Import { .. } => None,
         }
     }
@@ -205,6 +229,114 @@ fn revive_keyboard(items: &[Item]) -> Option<InlineKeyboardMarkup> {
     }
     rows.push(vec![InlineKeyboardButton::callback("DONE", "revive:done")]);
     Some(InlineKeyboardMarkup::new(rows))
+}
+
+fn categories_keyboard(categories: &[Category]) -> InlineKeyboardMarkup {
+    let mut rows = categories
+        .iter()
+        .enumerate()
+        .map(|(index, category)| {
+            vec![
+                InlineKeyboardButton::callback(
+                    format!("{} ({})", category.name, category.items.len()),
+                    format!("category:open:{index}"),
+                ),
+                InlineKeyboardButton::callback("🗑", format!("category:delete:{index}")),
+            ]
+        })
+        .collect::<Vec<_>>();
+    rows.push(vec![InlineKeyboardButton::callback(
+        "Create category",
+        "category:create",
+    )]);
+    rows.push(vec![InlineKeyboardButton::callback(
+        "Done",
+        "category:done",
+    )]);
+    InlineKeyboardMarkup::new(rows)
+}
+
+fn categories_text(categories: &[Category]) -> String {
+    if categories.is_empty() {
+        "No categories yet. Create one to get started.".to_string()
+    } else {
+        format!(
+            "Categories:\n{}",
+            categories
+                .iter()
+                .map(|category| format!("• {} ({} items)", category.name, category.items.len()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    }
+}
+
+fn category_editor_text(category: &Category) -> String {
+    if category.items.is_empty() {
+        return format!("Category: {}\n\nNo items yet.", category.name);
+    }
+    format!(
+        "Category: {}\n\n{}",
+        category.name,
+        category
+            .items
+            .iter()
+            .map(|item| format!("• {item}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
+}
+
+fn category_editor_keyboard(category: &Category) -> InlineKeyboardMarkup {
+    let mut rows = category
+        .items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            vec![InlineKeyboardButton::callback(
+                format!("🗑 {item}"),
+                format!("category:remove:{index}"),
+            )]
+        })
+        .collect::<Vec<_>>();
+    rows.push(vec![
+        InlineKeyboardButton::callback("Add", "category:add"),
+        InlineKeyboardButton::callback("Done", "category:done"),
+    ]);
+    InlineKeyboardMarkup::new(rows)
+}
+
+fn category_confirmation_keyboard() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![vec![
+        InlineKeyboardButton::callback("Delete", "category:confirm-delete"),
+        InlineKeyboardButton::callback("Cancel", "category:cancel-delete"),
+    ]])
+}
+
+fn category_candidates_text(category: &str, candidates: &[(String, u64)]) -> String {
+    if candidates.is_empty() {
+        format!("Category: {category}\n\nNo unassigned history items to add.")
+    } else {
+        format!("Choose an item to add to {category}:")
+    }
+}
+
+fn category_candidates_keyboard(candidates: &[(String, u64)]) -> InlineKeyboardMarkup {
+    let mut rows = candidates
+        .iter()
+        .enumerate()
+        .map(|(index, (item, count))| {
+            vec![InlineKeyboardButton::callback(
+                format!("{item} ({count})"),
+                format!("category:select:{index}"),
+            )]
+        })
+        .collect::<Vec<_>>();
+    rows.push(vec![InlineKeyboardButton::callback(
+        "Back",
+        "category:back",
+    )]);
+    InlineKeyboardMarkup::new(rows)
 }
 
 fn reorder_keyboard(items: &[Item]) -> InlineKeyboardMarkup {
@@ -583,6 +715,30 @@ async fn command_handler(
                 .await?;
         }
 
+        Command::Category => {
+            let categories = store.lock().await.categories(chat_id)?;
+            let sent = bot
+                .send_message(chat_id, categories_text(&categories))
+                .reply_markup(categories_keyboard(&categories))
+                .await?;
+            let generation = generation();
+            sessions.lock().await.insert(
+                chat_id.0,
+                Session::Category {
+                    message_id: sent.id,
+                    generation,
+                    mode: CategoryMode::Choose,
+                },
+            );
+            tokio::spawn(expire_session(
+                bot.clone(),
+                sessions.clone(),
+                chat_id,
+                generation,
+                CATEGORY_TIMEOUT,
+            ));
+        }
+
         Command::Help => {
             bot.send_message(chat_id, Command::descriptions().to_string())
                 .await?;
@@ -660,6 +816,61 @@ async fn text_handler(
                 .await?;
         }
 
+        Some(Session::Category {
+            message_id,
+            generation,
+            mode: CategoryMode::CreateName,
+        }) => {
+            let name = text.trim();
+            if name.is_empty() {
+                bot.send_message(chat_id, "Category names cannot be empty. Send a name:")
+                    .await?;
+                return Ok(());
+            }
+            let category = {
+                let store = store.lock().await;
+                if store
+                    .categories(chat_id)?
+                    .iter()
+                    .any(|category| category.name.to_lowercase() == name.to_lowercase())
+                {
+                    None
+                } else {
+                    Some(store.create_category(chat_id, name)?)
+                }
+            };
+            let Some(category) = category else {
+                bot.send_message(chat_id, "That category already exists. Send another name:")
+                    .await?;
+                return Ok(());
+            };
+            bot.edit_message_text(chat_id, message_id, category_editor_text(&category))
+                .reply_markup(category_editor_keyboard(&category))
+                .await?;
+            sessions.lock().await.insert(
+                chat_id.0,
+                Session::Category {
+                    message_id,
+                    generation,
+                    mode: CategoryMode::Edit(category.name),
+                },
+            );
+            tokio::spawn(expire_session(
+                bot.clone(),
+                sessions.clone(),
+                chat_id,
+                generation,
+                CATEGORY_TIMEOUT,
+            ));
+        }
+
+        Some(Session::Category { .. }) => {
+            warn!(
+                "ignoring text message while category editor is active: {}",
+                text
+            );
+        }
+
         Some(_) => {
             warn!(
                 "ignoring text message while callback-based dialog is active: {}",
@@ -672,6 +883,347 @@ async fn text_handler(
         }
     }
 
+    Ok(())
+}
+
+async fn set_category_view(
+    bot: &Bot,
+    sessions: &SharedSessions,
+    chat_id: ChatId,
+    message_id: MessageId,
+    generation: u64,
+    mode: CategoryMode,
+    text: String,
+    keyboard: InlineKeyboardMarkup,
+) -> Result<()> {
+    bot.edit_message_text(chat_id, message_id, text)
+        .reply_markup(keyboard)
+        .await?;
+    sessions.lock().await.insert(
+        chat_id.0,
+        Session::Category {
+            message_id,
+            generation,
+            mode,
+        },
+    );
+    tokio::spawn(expire_session(
+        bot.clone(),
+        sessions.clone(),
+        chat_id,
+        generation,
+        CATEGORY_TIMEOUT,
+    ));
+    Ok(())
+}
+
+async fn show_categories(
+    bot: &Bot,
+    store: &SharedStore,
+    sessions: &SharedSessions,
+    chat_id: ChatId,
+    message_id: MessageId,
+    generation: u64,
+) -> Result<()> {
+    let categories = store.lock().await.categories(chat_id)?;
+    set_category_view(
+        bot,
+        sessions,
+        chat_id,
+        message_id,
+        generation,
+        CategoryMode::Choose,
+        categories_text(&categories),
+        categories_keyboard(&categories),
+    )
+    .await
+}
+
+async fn show_category_editor(
+    bot: &Bot,
+    store: &SharedStore,
+    sessions: &SharedSessions,
+    chat_id: ChatId,
+    message_id: MessageId,
+    generation: u64,
+    category_name: &str,
+) -> Result<()> {
+    let category = store
+        .lock()
+        .await
+        .categories(chat_id)?
+        .into_iter()
+        .find(|category| category.name == category_name)
+        .with_context(|| format!("category {category_name:?} does not exist"))?;
+    set_category_view(
+        bot,
+        sessions,
+        chat_id,
+        message_id,
+        generation,
+        CategoryMode::Edit(category.name.clone()),
+        category_editor_text(&category),
+        category_editor_keyboard(&category),
+    )
+    .await
+}
+
+async fn category_callback(
+    bot: Bot,
+    query_id: teloxide::types::CallbackQueryId,
+    data: &str,
+    chat_id: ChatId,
+    clicked_message_id: MessageId,
+    store: SharedStore,
+    sessions: SharedSessions,
+) -> Result<()> {
+    let session = sessions.lock().await.get(&chat_id.0).cloned();
+    let Some(Session::Category {
+        message_id,
+        generation,
+        mode,
+    }) = session
+    else {
+        bot.answer_callback_query(query_id)
+            .text("This operation has expired")
+            .await?;
+        return Ok(());
+    };
+    if clicked_message_id != message_id {
+        bot.answer_callback_query(query_id)
+            .text("This operation has expired")
+            .await?;
+        return Ok(());
+    }
+
+    let Some(action) = data.strip_prefix("category:") else {
+        bot.answer_callback_query(query_id).await?;
+        return Ok(());
+    };
+    match action {
+        "done" => {
+            bot.answer_callback_query(query_id).await?;
+            bot.edit_message_reply_markup(chat_id, message_id)
+                .reply_markup(InlineKeyboardMarkup::default())
+                .await?;
+            sessions.lock().await.remove(&chat_id.0);
+        }
+        "create" if matches!(mode, CategoryMode::Choose) => {
+            bot.answer_callback_query(query_id).await?;
+            set_category_view(
+                &bot,
+                &sessions,
+                chat_id,
+                message_id,
+                generation,
+                CategoryMode::CreateName,
+                "Send a name for the new category:".to_string(),
+                InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
+                    "Cancel",
+                    "category:back",
+                )]]),
+            )
+            .await?;
+        }
+        action if action.starts_with("open:") && matches!(mode, CategoryMode::Choose) => {
+            let index = action
+                .strip_prefix("open:")
+                .and_then(|value| value.parse::<usize>().ok());
+            let categories = store.lock().await.categories(chat_id)?;
+            let Some(category) = index.and_then(|index| categories.get(index)) else {
+                bot.answer_callback_query(query_id)
+                    .text("Category no longer exists")
+                    .await?;
+                return Ok(());
+            };
+            let category = category.clone();
+            bot.answer_callback_query(query_id).await?;
+            set_category_view(
+                &bot,
+                &sessions,
+                chat_id,
+                message_id,
+                generation,
+                CategoryMode::Edit(category.name.clone()),
+                category_editor_text(&category),
+                category_editor_keyboard(&category),
+            )
+            .await?;
+        }
+        action if action.starts_with("delete:") && matches!(mode, CategoryMode::Choose) => {
+            let index = action
+                .strip_prefix("delete:")
+                .and_then(|value| value.parse::<usize>().ok());
+            let categories = store.lock().await.categories(chat_id)?;
+            let Some(category) = index.and_then(|index| categories.get(index)) else {
+                bot.answer_callback_query(query_id)
+                    .text("Category no longer exists")
+                    .await?;
+                return Ok(());
+            };
+            let name = category.name.clone();
+            bot.answer_callback_query(query_id).await?;
+            set_category_view(
+                &bot,
+                &sessions,
+                chat_id,
+                message_id,
+                generation,
+                CategoryMode::ConfirmDelete(name.clone()),
+                format!("Delete category {name:?} and all its items?"),
+                category_confirmation_keyboard(),
+            )
+            .await?;
+        }
+        "confirm-delete" => {
+            let CategoryMode::ConfirmDelete(category_name) = mode else {
+                bot.answer_callback_query(query_id)
+                    .text("Choose a category to delete first")
+                    .await?;
+                return Ok(());
+            };
+            store
+                .lock()
+                .await
+                .delete_category(chat_id, &category_name)?;
+            bot.answer_callback_query(query_id)
+                .text("Category deleted")
+                .await?;
+            show_categories(&bot, &store, &sessions, chat_id, message_id, generation).await?;
+        }
+        "cancel-delete" if matches!(mode, CategoryMode::ConfirmDelete(_)) => {
+            bot.answer_callback_query(query_id).await?;
+            show_categories(&bot, &store, &sessions, chat_id, message_id, generation).await?;
+        }
+        "back" => {
+            bot.answer_callback_query(query_id).await?;
+            if let CategoryMode::Add { category, .. } = mode {
+                show_category_editor(
+                    &bot, &store, &sessions, chat_id, message_id, generation, &category,
+                )
+                .await?;
+            } else {
+                show_categories(&bot, &store, &sessions, chat_id, message_id, generation).await?;
+            }
+        }
+        "add" => {
+            let CategoryMode::Edit(category_name) = mode else {
+                bot.answer_callback_query(query_id)
+                    .text("Open a category before adding items")
+                    .await?;
+                return Ok(());
+            };
+            let (history, categories) = {
+                let mut store = store.lock().await;
+                (
+                    store.history_items(chat_id).await?,
+                    store.categories(chat_id)?,
+                )
+            };
+            let candidates = history
+                .into_iter()
+                .filter(|(item, _)| {
+                    !categories
+                        .iter()
+                        .any(|category| category.items.iter().any(|assigned| assigned == item))
+                })
+                .collect::<Vec<_>>();
+            let texts = candidates.iter().map(|(item, _)| item.clone()).collect();
+            bot.answer_callback_query(query_id).await?;
+            set_category_view(
+                &bot,
+                &sessions,
+                chat_id,
+                message_id,
+                generation,
+                CategoryMode::Add {
+                    category: category_name.clone(),
+                    candidates: texts,
+                },
+                category_candidates_text(&category_name, &candidates),
+                category_candidates_keyboard(&candidates),
+            )
+            .await?;
+        }
+        action if action.starts_with("remove:") => {
+            let CategoryMode::Edit(category_name) = mode else {
+                bot.answer_callback_query(query_id)
+                    .text("Open a category before removing items")
+                    .await?;
+                return Ok(());
+            };
+            let index = action
+                .strip_prefix("remove:")
+                .and_then(|value| value.parse::<usize>().ok());
+            let category = store
+                .lock()
+                .await
+                .categories(chat_id)?
+                .into_iter()
+                .find(|category| category.name == category_name)
+                .context("category no longer exists")?;
+            let Some(item) = index.and_then(|index| category.items.get(index)).cloned() else {
+                bot.answer_callback_query(query_id)
+                    .text("Item no longer exists")
+                    .await?;
+                return Ok(());
+            };
+            store
+                .lock()
+                .await
+                .remove_category_item(chat_id, &category_name, &item)?;
+            bot.answer_callback_query(query_id)
+                .text(format!("Removed {item}"))
+                .await?;
+            show_category_editor(
+                &bot,
+                &store,
+                &sessions,
+                chat_id,
+                message_id,
+                generation,
+                &category_name,
+            )
+            .await?;
+        }
+        action if action.starts_with("select:") => {
+            let CategoryMode::Add {
+                category,
+                candidates,
+            } = mode
+            else {
+                bot.answer_callback_query(query_id)
+                    .text("Choose Add before selecting an item")
+                    .await?;
+                return Ok(());
+            };
+            let index = action
+                .strip_prefix("select:")
+                .and_then(|value| value.parse::<usize>().ok());
+            let Some(item) = index.and_then(|index| candidates.get(index)).cloned() else {
+                bot.answer_callback_query(query_id)
+                    .text("Item is no longer available")
+                    .await?;
+                return Ok(());
+            };
+            store
+                .lock()
+                .await
+                .add_category_item(chat_id, &category, &item)?;
+            bot.answer_callback_query(query_id)
+                .text(format!("Added {item}"))
+                .await?;
+            show_category_editor(
+                &bot, &store, &sessions, chat_id, message_id, generation, &category,
+            )
+            .await?;
+        }
+        _ => {
+            bot.answer_callback_query(query_id)
+                .text("Invalid category action")
+                .await?;
+        }
+    }
     Ok(())
 }
 
@@ -690,6 +1242,11 @@ async fn callback_handler(
     let Some(data) = query.data.as_deref() else {
         return Ok(());
     };
+
+    if data.starts_with("category:") {
+        return category_callback(bot, query.id, data, chat_id, message.id(), store, sessions)
+            .await;
+    }
 
     if let Some(action) = data.strip_prefix("revive:") {
         let session = sessions.lock().await.get(&chat_id.0).cloned();
@@ -1217,6 +1774,12 @@ async fn callback_handler(
         Some(Session::Revive { .. }) => {
             bot.answer_callback_query(query.id)
                 .text("Please select a checked item")
+                .await?;
+        }
+
+        Some(Session::Category { .. }) => {
+            bot.answer_callback_query(query.id)
+                .text("Please use the category editor buttons")
                 .await?;
         }
 
