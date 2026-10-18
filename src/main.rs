@@ -1025,10 +1025,14 @@ async fn category_callback(
     match action {
         "done" => {
             bot.answer_callback_query(query_id).await?;
-            bot.edit_message_reply_markup(chat_id, message_id)
-                .reply_markup(InlineKeyboardMarkup::default())
-                .await?;
-            sessions.lock().await.remove(&chat_id.0);
+            if matches!(mode, CategoryMode::Edit(_)) {
+                show_categories(&bot, &store, &sessions, chat_id, message_id, generation).await?;
+            } else {
+                bot.edit_message_reply_markup(chat_id, message_id)
+                    .reply_markup(InlineKeyboardMarkup::default())
+                    .await?;
+                sessions.lock().await.remove(&chat_id.0);
+            }
         }
         "create" if matches!(mode, CategoryMode::Choose) => {
             bot.answer_callback_query(query_id).await?;
