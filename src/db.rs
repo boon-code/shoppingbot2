@@ -274,6 +274,32 @@ impl Store {
         Ok(categories)
     }
 
+    pub async fn sort_items_by_category(&mut self, chat_id: ChatId) -> Result<()> {
+        let mut category_priorities = HashMap::new();
+        for category in self.categories(chat_id)? {
+            for item in category.items {
+                let canonical = normalize_history_text(&item);
+                if canonical.is_empty() {
+                    continue;
+                }
+                category_priorities
+                    .entry(canonical)
+                    .and_modify(|priority: &mut i32| *priority = (*priority).min(category.priority))
+                    .or_insert(category.priority);
+            }
+        }
+
+        let chat_key = self.ensure_cached(chat_id).await?;
+        let entry = self.cache.get_mut(&chat_key).expect("cached list exists");
+        let items = Arc::make_mut(&mut entry.items);
+        items.sort_by_key(|item| {
+            let priority = category_priorities.get(&normalize_history_text(&item.item));
+            (priority.is_none(), priority.copied().unwrap_or_default())
+        });
+        let items = Arc::clone(&entry.items);
+        self.queue_save(chat_key, items)
+    }
+
     pub async fn history_items(&mut self, chat_id: ChatId) -> Result<Vec<(String, u64)>> {
         self.load_history(chat_id).await?;
         let mut items = self.history[&chat_id.0.to_string()]
@@ -1207,6 +1233,53 @@ mod tests {
             store
                 .rename_category(chat_id, "Fresh Produce", "Pantry")
                 .is_err()
+        );
+
+        store.shutdown().unwrap();
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn sorts_category_matches_by_priority_and_keeps_unmatched_items_in_order() {
+        let directory = test_directory("sort-by-category");
+        let mut store = Store::load(&directory).await.unwrap();
+        let chat_id = ChatId(1234);
+        store.create_category(chat_id, "Later").unwrap();
+        store.set_category_priority(chat_id, "Later", 5).unwrap();
+        store.add_category_item(chat_id, "Later", "Milk").unwrap();
+        store.create_category(chat_id, "First").unwrap();
+        store.set_category_priority(chat_id, "First", -2).unwrap();
+        store.add_category_item(chat_id, "First", "Bread").unwrap();
+        store
+            .add_items(
+                chat_id,
+                vec![
+                    "unmatched one".to_string(),
+                    "Milk".to_string(),
+                    "2x pkg Bread".to_string(),
+                    "unmatched two".to_string(),
+                    "Another milk".to_string(),
+                ],
+            )
+            .await
+            .unwrap();
+
+        store.sort_items_by_category(chat_id).await.unwrap();
+        let items = store.items(chat_id).await.unwrap();
+        let item_names = items
+            .iter()
+            .map(|item| item.item.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            item_names,
+            vec![
+                "2x pkg Bread",
+                "Milk",
+                "unmatched one",
+                "unmatched two",
+                "Another milk"
+            ]
         );
 
         store.shutdown().unwrap();

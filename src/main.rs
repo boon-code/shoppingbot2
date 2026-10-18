@@ -84,6 +84,9 @@ enum Command {
     #[command(description = "Reorder items on list")]
     Reorder,
 
+    #[command(description = "Sort items by category priority")]
+    Categorize,
+
     #[command(description = "Remove checked items from list")]
     Cleanup,
 
@@ -716,6 +719,12 @@ async fn command_handler(
                 generation,
                 REORDER_TIMEOUT,
             ));
+        }
+
+        Command::Categorize => {
+            store.lock().await.sort_items_by_category(chat_id).await?;
+            bot.send_message(chat_id, "Sorted items by category priority")
+                .await?;
         }
 
         Command::Cancel => {
