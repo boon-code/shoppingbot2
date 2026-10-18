@@ -317,6 +317,47 @@ impl Store {
         write_category(&self.path, chat_id, &category)
     }
 
+    pub fn rename_category(
+        &self,
+        chat_id: ChatId,
+        category_name: &str,
+        new_name: &str,
+    ) -> Result<()> {
+        let new_name = new_name.trim();
+        if new_name.is_empty() {
+            bail!("category name cannot be empty");
+        }
+
+        let mut category = self.category(chat_id, category_name)?;
+        if self.categories(chat_id)?.iter().any(|existing| {
+            existing.name != category.name && existing.name.eq_ignore_ascii_case(new_name)
+        }) {
+            bail!("category already exists");
+        }
+
+        let old_file = self
+            .path
+            .join(categories_directory_name(&chat_id.0.to_string()))
+            .join(category_file_name(&category.name));
+        category.name = new_name.to_string();
+        write_category(&self.path, chat_id, &category)?;
+
+        let new_file = old_file
+            .parent()
+            .context("category file path has no parent")?
+            .join(category_file_name(&category.name));
+        if old_file != new_file {
+            fs::remove_file(&old_file)
+                .with_context(|| format!("failed to remove {}", old_file.display()))?;
+            sync_directory(
+                old_file
+                    .parent()
+                    .context("category file path has no parent")?,
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn add_category_item(
         &self,
         chat_id: ChatId,
@@ -1136,6 +1177,40 @@ mod tests {
             .unwrap();
         assert_eq!(category.priority, 7);
         drop(reopened);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn renames_category_without_losing_items_or_priority() {
+        let directory = test_directory("rename-category");
+        let mut store = Store::load(&directory).await.unwrap();
+        let chat_id = ChatId(1234);
+        store.create_category(chat_id, "Produce").unwrap();
+        store
+            .add_category_item(chat_id, "Produce", "tomaten")
+            .unwrap();
+        store.set_category_priority(chat_id, "Produce", 7).unwrap();
+        store.create_category(chat_id, "Pantry").unwrap();
+
+        store
+            .rename_category(chat_id, "Produce", "Fresh Produce")
+            .unwrap();
+        let categories = store.categories(chat_id).unwrap();
+        let renamed = categories
+            .iter()
+            .find(|category| category.name == "Fresh Produce")
+            .unwrap();
+        assert_eq!(renamed.items, vec!["tomaten"]);
+        assert_eq!(renamed.priority, 7);
+        assert!(!categories.iter().any(|category| category.name == "Produce"));
+        assert!(
+            store
+                .rename_category(chat_id, "Fresh Produce", "Pantry")
+                .is_err()
+        );
+
+        store.shutdown().unwrap();
+        drop(store);
         fs::remove_dir_all(directory).unwrap();
     }
 

@@ -143,6 +143,8 @@ enum CategoryMode {
     CreateName,
     SetPriority(String),
     Edit(String),
+    Manage(String),
+    Rename(String),
     Add {
         category: String,
         candidates: Vec<String>,
@@ -246,7 +248,7 @@ fn categories_keyboard(categories: &[Category]) -> InlineKeyboardMarkup {
                     format!("⭐ {}", category.priority),
                     format!("category:priority:{index}"),
                 ),
-                InlineKeyboardButton::callback("🗑", format!("category:delete:{index}")),
+                InlineKeyboardButton::callback("✏️ Edit", format!("category:manage:{index}")),
             ]
         })
         .collect::<Vec<_>>();
@@ -316,6 +318,14 @@ fn category_confirmation_keyboard() -> InlineKeyboardMarkup {
         InlineKeyboardButton::callback("Delete", "category:confirm-delete"),
         InlineKeyboardButton::callback("Cancel", "category:cancel-delete"),
     ]])
+}
+
+fn category_management_keyboard() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![
+        vec![InlineKeyboardButton::callback("Rename", "category:rename")],
+        vec![InlineKeyboardButton::callback("Delete", "category:delete")],
+        vec![InlineKeyboardButton::callback("Back", "category:back")],
+    ])
 }
 
 fn category_candidates_text(category: &str, candidates: &[(String, u64)]) -> String {
@@ -872,6 +882,36 @@ async fn text_handler(
         Some(Session::Category {
             message_id,
             generation,
+            mode: CategoryMode::Rename(category_name),
+        }) => {
+            let name = text.trim();
+            if name.is_empty() {
+                bot.send_message(chat_id, "Category names cannot be empty. Send a name:")
+                    .await?;
+                return Ok(());
+            }
+            let duplicate = {
+                let store_guard = store.lock().await;
+                if store_guard.categories(chat_id)?.iter().any(|category| {
+                    category.name != category_name && category.name.eq_ignore_ascii_case(name)
+                }) {
+                    true
+                } else {
+                    store_guard.rename_category(chat_id, &category_name, name)?;
+                    false
+                }
+            };
+            if duplicate {
+                bot.send_message(chat_id, "That category already exists. Send another name:")
+                    .await?;
+                return Ok(());
+            }
+            show_categories(&bot, &store, &sessions, chat_id, message_id, generation).await?;
+        }
+
+        Some(Session::Category {
+            message_id,
+            generation,
             mode: CategoryMode::SetPriority(category_name),
         }) => {
             let Ok(priority) = text.trim().parse::<i32>() else {
@@ -1051,6 +1091,31 @@ async fn category_callback(
             )
             .await?;
         }
+        action if action.starts_with("manage:") && matches!(mode, CategoryMode::Choose) => {
+            let index = action
+                .strip_prefix("manage:")
+                .and_then(|value| value.parse::<usize>().ok());
+            let categories = store.lock().await.categories(chat_id)?;
+            let Some(category) = index.and_then(|index| categories.get(index)) else {
+                bot.answer_callback_query(query_id)
+                    .text("Category no longer exists")
+                    .await?;
+                return Ok(());
+            };
+            let category_name = category.name.clone();
+            bot.answer_callback_query(query_id).await?;
+            set_category_view(
+                &bot,
+                &sessions,
+                chat_id,
+                message_id,
+                generation,
+                CategoryMode::Manage(category_name.clone()),
+                format!("Edit category: {category_name}"),
+                category_management_keyboard(),
+            )
+            .await?;
+        }
         action if action.starts_with("open:") && matches!(mode, CategoryMode::Choose) => {
             let index = action
                 .strip_prefix("open:")
@@ -1105,18 +1170,13 @@ async fn category_callback(
             )
             .await?;
         }
-        action if action.starts_with("delete:") && matches!(mode, CategoryMode::Choose) => {
-            let index = action
-                .strip_prefix("delete:")
-                .and_then(|value| value.parse::<usize>().ok());
-            let categories = store.lock().await.categories(chat_id)?;
-            let Some(category) = index.and_then(|index| categories.get(index)) else {
+        "rename" => {
+            let CategoryMode::Manage(category_name) = mode else {
                 bot.answer_callback_query(query_id)
-                    .text("Category no longer exists")
+                    .text("Choose a category to rename first")
                     .await?;
                 return Ok(());
             };
-            let name = category.name.clone();
             bot.answer_callback_query(query_id).await?;
             set_category_view(
                 &bot,
@@ -1124,8 +1184,31 @@ async fn category_callback(
                 chat_id,
                 message_id,
                 generation,
-                CategoryMode::ConfirmDelete(name.clone()),
-                format!("Delete category {name:?} and all its items?"),
+                CategoryMode::Rename(category_name.clone()),
+                format!("Send a new name for {category_name}:"),
+                InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
+                    "Back",
+                    "category:back",
+                )]]),
+            )
+            .await?;
+        }
+        "delete" => {
+            let CategoryMode::Manage(category_name) = mode else {
+                bot.answer_callback_query(query_id)
+                    .text("Choose a category to delete first")
+                    .await?;
+                return Ok(());
+            };
+            bot.answer_callback_query(query_id).await?;
+            set_category_view(
+                &bot,
+                &sessions,
+                chat_id,
+                message_id,
+                generation,
+                CategoryMode::ConfirmDelete(category_name.clone()),
+                format!("Delete category {category_name:?} and all its items?"),
                 category_confirmation_keyboard(),
             )
             .await?;
@@ -1146,19 +1229,53 @@ async fn category_callback(
                 .await?;
             show_categories(&bot, &store, &sessions, chat_id, message_id, generation).await?;
         }
-        "cancel-delete" if matches!(mode, CategoryMode::ConfirmDelete(_)) => {
+        "cancel-delete" => {
+            let CategoryMode::ConfirmDelete(category_name) = mode else {
+                bot.answer_callback_query(query_id)
+                    .text("Choose a category to delete first")
+                    .await?;
+                return Ok(());
+            };
             bot.answer_callback_query(query_id).await?;
-            show_categories(&bot, &store, &sessions, chat_id, message_id, generation).await?;
+            set_category_view(
+                &bot,
+                &sessions,
+                chat_id,
+                message_id,
+                generation,
+                CategoryMode::Manage(category_name.clone()),
+                format!("Edit category: {category_name}"),
+                category_management_keyboard(),
+            )
+            .await?;
         }
         "back" => {
             bot.answer_callback_query(query_id).await?;
-            if let CategoryMode::Add { category, .. } = mode {
-                show_category_editor(
-                    &bot, &store, &sessions, chat_id, message_id, generation, &category,
-                )
-                .await?;
-            } else {
-                show_categories(&bot, &store, &sessions, chat_id, message_id, generation).await?;
+            match mode {
+                CategoryMode::Add { category, .. } => {
+                    show_category_editor(
+                        &bot, &store, &sessions, chat_id, message_id, generation, &category,
+                    )
+                    .await?;
+                }
+                CategoryMode::Rename(category_name)
+                | CategoryMode::ConfirmDelete(category_name) => {
+                    set_category_view(
+                        &bot,
+                        &sessions,
+                        chat_id,
+                        message_id,
+                        generation,
+                        CategoryMode::Manage(category_name.clone()),
+                        format!("Edit category: {category_name}"),
+                        category_management_keyboard(),
+                    )
+                    .await?;
+                }
+                _ => {
+                    show_categories(&bot, &store, &sessions, chat_id, message_id, generation)
+                        .await?;
+                }
             }
         }
         "add" => {
