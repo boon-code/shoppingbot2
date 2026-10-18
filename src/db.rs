@@ -32,6 +32,12 @@ struct LegacyDatabase {
     chats: HashMap<String, Vec<Item>>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct HistoryEntry {
+    text: String,
+    count: u64,
+}
+
 struct CacheEntry {
     items: Arc<Vec<Item>>,
     next_id: u64,
@@ -56,6 +62,7 @@ enum WriterMessage {
 pub struct Store {
     path: PathBuf,
     cache: HashMap<String, CacheEntry>,
+    history: HashMap<String, Vec<HistoryEntry>>,
     lru: VecDeque<String>,
     pending_writes: PendingWrites,
     writer_sender: Option<Sender<WriterMessage>>,
@@ -93,6 +100,7 @@ impl Store {
         Ok(Self {
             path: data_path,
             cache: HashMap::new(),
+            history: HashMap::new(),
             lru: VecDeque::new(),
             pending_writes,
             writer_sender: Some(writer_sender),
@@ -228,11 +236,12 @@ impl Store {
             .context("shopping list item id overflow")?;
         Arc::make_mut(&mut entry.items).push(Item {
             id,
-            item: text,
+            item: text.clone(),
             checked: false,
         });
         let items = Arc::clone(&entry.items);
-        self.queue_save(chat_key, items)
+        self.queue_save(chat_key.clone(), items)?;
+        self.track_history(&chat_key, &[text]).await
     }
 
     pub async fn add_items(&mut self, chat_id: ChatId, texts: Vec<String>) -> Result<()> {
@@ -248,16 +257,72 @@ impl Store {
             .checked_add(texts.len() as u64)
             .context("shopping list item id overflow")?;
         let items = Arc::make_mut(&mut entry.items);
-        for (offset, text) in texts.into_iter().enumerate() {
+        for (offset, text) in texts.iter().enumerate() {
             items.push(Item {
                 id: start_id + offset as u64,
-                item: text,
+                item: text.clone(),
                 checked: false,
             });
         }
         entry.next_id = end_id;
         let items = Arc::clone(&entry.items);
-        self.queue_save(chat_key, items)
+        self.queue_save(chat_key.clone(), items)?;
+        self.track_history(&chat_key, &texts).await
+    }
+
+    async fn track_history(&mut self, chat_id: &str, texts: &[String]) -> Result<()> {
+        if !self.history.contains_key(chat_id) {
+            let file_path = self.path.join(history_file_name(chat_id));
+            let history = match async_fs::read_to_string(&file_path).await {
+                Ok(contents) => contents
+                    .lines()
+                    .enumerate()
+                    .filter(|(_, line)| !line.trim().is_empty())
+                    .map(|(index, line)| {
+                        serde_json::from_str(line).with_context(|| {
+                            format!(
+                                "invalid history entry at line {} in {}",
+                                index + 1,
+                                file_path.display()
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<HistoryEntry>>>()?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to read {}", file_path.display()));
+                }
+            };
+            self.history.insert(chat_id.to_string(), history);
+        }
+
+        let mut updated_history = self.history[chat_id].clone();
+        for text in texts {
+            let normalized = normalize_history_text(text);
+            if normalized.is_empty() {
+                continue;
+            }
+
+            if let Some(entry) = updated_history
+                .iter_mut()
+                .find(|entry| entry.text == normalized)
+            {
+                entry.count = entry
+                    .count
+                    .checked_add(1)
+                    .context("shopping history count overflow")?;
+            } else {
+                updated_history.push(HistoryEntry {
+                    text: normalized,
+                    count: 1,
+                });
+            }
+        }
+
+        write_history_atomically(&self.path, chat_id, &updated_history)?;
+        self.history.insert(chat_id.to_string(), updated_history);
+        Ok(())
     }
 
     pub async fn check_item(&mut self, chat_id: ChatId, id: u64) -> Result<Option<Item>> {
@@ -453,12 +518,165 @@ impl Drop for Store {
 }
 
 fn list_file_name(chat_id: &str) -> String {
-    let hex_id = chat_id
+    format!("list_{}.json", hex_encode(chat_id))
+}
+
+fn history_file_name(chat_id: &str) -> String {
+    format!("history_{}", hex_encode(chat_id))
+}
+
+fn hex_encode(value: &str) -> String {
+    value
         .as_bytes()
         .iter()
         .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    format!("list_{hex_id}.json")
+        .collect()
+}
+
+fn normalize_history_text(text: &str) -> String {
+    let mut words: Vec<String> = text.split_whitespace().map(str::to_lowercase).collect();
+
+    let Some(first) = words.first().cloned() else {
+        return String::new();
+    };
+    let Some((number_end, suffix)) = amount_token(&first) else {
+        return words.join(" ");
+    };
+    let suffix = suffix.to_string();
+
+    if number_end == 0 {
+        return words.join(" ");
+    }
+
+    words.remove(0);
+    if suffix.is_empty() {
+        if words.first().is_some_and(|word| word == "x") {
+            words.remove(0);
+        }
+        if words.first().is_some_and(|word| is_amount_unit(word)) {
+            words.remove(0);
+        }
+    } else if suffix == "x" {
+        if words.first().is_some_and(|word| word == "x") {
+            words.remove(0);
+        }
+    }
+
+    while words.first().is_some_and(|word| is_package_prefix(word)) {
+        words.remove(0);
+    }
+    if words
+        .first()
+        .is_some_and(|word| word == "of" || word == "von")
+    {
+        words.remove(0);
+    }
+
+    words.join(" ")
+}
+
+fn amount_token(word: &str) -> Option<(usize, &str)> {
+    let number_end = word
+        .char_indices()
+        .find(|(_, character)| {
+            !character.is_ascii_digit() && *character != '.' && *character != ','
+        })
+        .map(|(index, _)| index)
+        .unwrap_or(word.len());
+    if number_end == 0
+        || !word[..number_end]
+            .chars()
+            .any(|character| character.is_ascii_digit())
+    {
+        return None;
+    }
+
+    let suffix = &word[number_end..];
+    if suffix.is_empty() || suffix == "x" || is_amount_unit(suffix) {
+        Some((number_end, suffix))
+    } else {
+        None
+    }
+}
+
+fn is_amount_unit(word: &str) -> bool {
+    matches!(
+        word,
+        "g" | "kg"
+            | "mg"
+            | "ml"
+            | "cl"
+            | "dl"
+            | "l"
+            | "oz"
+            | "lb"
+            | "lbs"
+            | "pc"
+            | "pcs"
+            | "piece"
+            | "pieces"
+            | "stk"
+            | "st"
+            | "stück"
+            | "stueck"
+    )
+}
+
+fn is_package_prefix(word: &str) -> bool {
+    matches!(
+        word,
+        "pkg"
+            | "pack"
+            | "package"
+            | "packet"
+            | "box"
+            | "bag"
+            | "bottle"
+            | "can"
+            | "tin"
+            | "jar"
+            | "bunch"
+            | "dose"
+            | "beutel"
+            | "flasche"
+            | "glas"
+    )
+}
+
+fn write_history_atomically(
+    directory: &Path,
+    chat_id: &str,
+    history: &[HistoryEntry],
+) -> Result<()> {
+    let file_name = history_file_name(chat_id);
+    let destination = directory.join(&file_name);
+    let temporary = directory.join(format!(".tmp_{file_name}"));
+    let mut data = Vec::new();
+    for entry in history {
+        serde_json::to_writer(&mut data, entry).context("failed to serialize history entry")?;
+        data.push(b'\n');
+    }
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temporary)
+        .with_context(|| format!("failed to create {}", temporary.display()))?;
+    file.write_all(&data)
+        .and_then(|()| file.sync_all())
+        .with_context(|| format!("failed to sync {}", temporary.display()))?;
+    drop(file);
+
+    fs::rename(&temporary, &destination).with_context(|| {
+        format!(
+            "failed to replace history {} with {}",
+            destination.display(),
+            temporary.display()
+        )
+    })?;
+    sync_directory(directory)?;
+    Ok(())
 }
 
 fn write_list_atomically(directory: &Path, chat_id: &str, items: &[Item]) -> Result<()> {
@@ -660,6 +878,78 @@ mod tests {
     fn chat_id_is_encoded_as_hex_of_its_string() {
         assert_eq!(list_file_name("1234"), "list_31323334.json");
         assert_eq!(list_file_name("-100"), "list_2d313030.json");
+        assert_eq!(history_file_name("1234"), "history_31323334");
+    }
+
+    #[test]
+    fn normalizes_common_amount_and_package_prefixes() {
+        assert_eq!(normalize_history_text("Tomaten"), "tomaten");
+        assert_eq!(normalize_history_text("1x pkg Tomaten"), "tomaten");
+        assert_eq!(normalize_history_text("500g Tomaten"), "tomaten");
+        assert_eq!(normalize_history_text("3 Tomaten"), "tomaten");
+        assert_eq!(normalize_history_text("1 x pack of TOMATEN"), "tomaten");
+        assert_eq!(normalize_history_text("500 g Tomaten"), "tomaten");
+    }
+
+    #[tokio::test]
+    async fn tracks_normalized_history_per_chat() {
+        let directory = test_directory("history");
+        let chat_id = ChatId(1234);
+        let mut store = Store::load(&directory).await.unwrap();
+
+        store
+            .add_items(
+                chat_id,
+                vec![
+                    "Tomaten".to_string(),
+                    "1x pkg Tomaten".to_string(),
+                    "500g Tomaten".to_string(),
+                    "3 Tomaten".to_string(),
+                ],
+            )
+            .await
+            .unwrap();
+        store
+            .add_item(ChatId(1235), "Tomaten".to_string())
+            .await
+            .unwrap();
+        store.shutdown().unwrap();
+
+        let entries: Vec<HistoryEntry> = fs::read_to_string(directory.join("history_31323334"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![HistoryEntry {
+                text: "tomaten".to_string(),
+                count: 4,
+            }]
+        );
+
+        let other_chat: Vec<HistoryEntry> = fs::read_to_string(directory.join("history_31323335"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(other_chat[0].count, 1);
+
+        drop(store);
+
+        let mut reopened = Store::load(&directory).await.unwrap();
+        reopened
+            .add_item(chat_id, "1kg Tomaten".to_string())
+            .await
+            .unwrap();
+        reopened.shutdown().unwrap();
+        drop(reopened);
+        let persisted: HistoryEntry =
+            serde_json::from_str(&fs::read_to_string(directory.join("history_31323334")).unwrap())
+                .unwrap();
+        assert_eq!(persisted.count, 5);
+
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]
