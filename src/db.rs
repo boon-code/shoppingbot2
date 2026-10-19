@@ -36,6 +36,13 @@ struct LegacyDatabase {
 struct HistoryEntry {
     text: String,
     count: u64,
+    #[serde(default)]
+    spelling: Vec<HashMap<String, HistorySpellingCount>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct HistorySpellingCount {
+    count: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -899,7 +906,8 @@ impl Store {
 
         let mut updated_history = self.history[chat_id].clone();
         for text in texts {
-            let normalized = normalize_history_text(text);
+            let spelling = normalize_history_spelling(text);
+            let normalized = spelling.to_lowercase();
             if normalized.is_empty() {
                 continue;
             }
@@ -912,10 +920,29 @@ impl Store {
                     .count
                     .checked_add(1)
                     .context("shopping history count overflow")?;
+                if let Some(spelling_entry) = entry
+                    .spelling
+                    .iter_mut()
+                    .find_map(|spellings| spellings.get_mut(&spelling))
+                {
+                    spelling_entry.count = spelling_entry
+                        .count
+                        .checked_add(1)
+                        .context("shopping history spelling count overflow")?;
+                } else {
+                    entry.spelling.push(HashMap::from([(
+                        spelling,
+                        HistorySpellingCount { count: 1 },
+                    )]));
+                }
             } else {
                 updated_history.push(HistoryEntry {
                     text: normalized,
                     count: 1,
+                    spelling: vec![HashMap::from([(
+                        spelling,
+                        HistorySpellingCount { count: 1 },
+                    )])],
                 });
             }
         }
@@ -1433,12 +1460,17 @@ fn write_category(directory: &Path, chat_id: ChatId, category: &Category) -> Res
 }
 
 fn normalize_history_text(text: &str) -> String {
-    let mut words: Vec<String> = text.split_whitespace().map(str::to_lowercase).collect();
+    normalize_history_spelling(text).to_lowercase()
+}
+
+fn normalize_history_spelling(text: &str) -> String {
+    let mut words: Vec<&str> = text.split_whitespace().collect();
 
     let Some(first) = words.first().cloned() else {
         return String::new();
     };
-    let Some((number_end, suffix)) = amount_token(&first) else {
+    let lower_first = first.to_lowercase();
+    let Some((number_end, suffix)) = amount_token(&lower_first) else {
         return words.join(" ");
     };
     let suffix = suffix.to_string();
@@ -1449,24 +1481,36 @@ fn normalize_history_text(text: &str) -> String {
 
     words.remove(0);
     if suffix.is_empty() {
-        if words.first().is_some_and(|word| word == "x") {
+        if words
+            .first()
+            .is_some_and(|word| word.eq_ignore_ascii_case("x"))
+        {
             words.remove(0);
         }
-        if words.first().is_some_and(|word| is_amount_unit(word)) {
+        if words
+            .first()
+            .is_some_and(|word| is_amount_unit(&word.to_lowercase()))
+        {
             words.remove(0);
         }
     } else if suffix == "x" {
-        if words.first().is_some_and(|word| word == "x") {
+        if words
+            .first()
+            .is_some_and(|word| word.eq_ignore_ascii_case("x"))
+        {
             words.remove(0);
         }
     }
 
-    while words.first().is_some_and(|word| is_package_prefix(word)) {
+    while words
+        .first()
+        .is_some_and(|word| is_package_prefix(&word.to_lowercase()))
+    {
         words.remove(0);
     }
     if words
         .first()
-        .is_some_and(|word| word == "of" || word == "von")
+        .is_some_and(|word| word.eq_ignore_ascii_case("of") || word.eq_ignore_ascii_case("von"))
     {
         words.remove(0);
     }
@@ -1788,6 +1832,8 @@ mod tests {
         assert_eq!(normalize_history_text("3 Tomaten"), "tomaten");
         assert_eq!(normalize_history_text("1 x pack of TOMATEN"), "tomaten");
         assert_eq!(normalize_history_text("500 g Tomaten"), "tomaten");
+        assert_eq!(normalize_history_spelling("1 x pack of TOMATEN"), "TOMATEN");
+        assert_eq!(normalize_history_spelling("500ML Tomaten"), "Tomaten");
     }
 
     #[tokio::test]
@@ -2173,8 +2219,8 @@ mod tests {
                 vec![
                     "Tomaten".to_string(),
                     "1x pkg Tomaten".to_string(),
-                    "500g Tomaten".to_string(),
-                    "3 Tomaten".to_string(),
+                    "500g tomaten".to_string(),
+                    "3 TOMATEN".to_string(),
                     "Kartoffeln".to_string(),
                     "Kartoffeln".to_string(),
                 ],
@@ -2198,10 +2244,25 @@ mod tests {
                 HistoryEntry {
                     text: "tomaten".to_string(),
                     count: 4,
+                    spelling: vec![
+                        HashMap::from([
+                            ("Tomaten".to_string(), HistorySpellingCount { count: 2 },)
+                        ]),
+                        HashMap::from([
+                            ("tomaten".to_string(), HistorySpellingCount { count: 1 },)
+                        ]),
+                        HashMap::from([
+                            ("TOMATEN".to_string(), HistorySpellingCount { count: 1 },)
+                        ]),
+                    ],
                 },
                 HistoryEntry {
                     text: "kartoffeln".to_string(),
                     count: 2,
+                    spelling: vec![HashMap::from([(
+                        "Kartoffeln".to_string(),
+                        HistorySpellingCount { count: 2 },
+                    )])],
                 },
             ]
         );
@@ -2234,6 +2295,7 @@ mod tests {
             .collect();
         assert_eq!(persisted[0].count, 5);
         assert_eq!(persisted[1].count, 2);
+        assert_eq!(persisted[0].spelling[0]["Tomaten"].count, 3);
 
         fs::remove_dir_all(directory).unwrap();
     }
