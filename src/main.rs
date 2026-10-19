@@ -88,9 +88,6 @@ enum Command {
     #[command(description = "Sort items by category or shop layout")]
     Categorize,
 
-    #[command(description = "Manage shop layouts")]
-    Layouts,
-
     #[command(description = "Remove checked items from list")]
     Cleanup,
 
@@ -151,33 +148,22 @@ enum Session {
 }
 
 #[derive(Clone, Debug)]
-enum LayoutReturn {
-    Main,
-    Select,
-}
-
-#[derive(Clone, Debug)]
 enum LayoutMode {
-    Main,
     Select,
     CreateName,
     Manage {
         name: String,
-        return_to: LayoutReturn,
     },
     Rename {
         name: String,
-        return_to: LayoutReturn,
     },
     Arrange {
         name: String,
         categories: Vec<String>,
         moving: Option<usize>,
-        return_to: LayoutReturn,
     },
     ConfirmDelete {
         name: String,
-        return_to: LayoutReturn,
     },
 }
 
@@ -324,21 +310,12 @@ fn categories_text(categories: &[Category]) -> String {
     }
 }
 
-fn layouts_text(layouts: &[Layout], selecting: bool) -> String {
+fn layouts_text(layouts: &[Layout]) -> String {
     if layouts.is_empty() {
-        return if selecting {
-            "No shop layouts are defined. Press Back to sort by category priority.".to_string()
-        } else {
-            "No shop layouts yet. Create one to get started.".to_string()
-        };
+        return "No shop layouts are defined.".to_string();
     }
-    let intro = if selecting {
-        "Choose a shop layout to sort your list:"
-    } else {
-        "Shop layouts:"
-    };
     format!(
-        "{intro}\n{}",
+        "Choose a layout to sort your list, or edit one:\n{}",
         layouts
             .iter()
             .map(|layout| format!("• {}", layout.name))
@@ -347,36 +324,28 @@ fn layouts_text(layouts: &[Layout], selecting: bool) -> String {
     )
 }
 
-fn layouts_keyboard(layouts: &[Layout], selecting: bool) -> InlineKeyboardMarkup {
+fn layouts_keyboard(layouts: &[Layout]) -> InlineKeyboardMarkup {
     let mut rows = layouts
         .iter()
         .enumerate()
         .map(|(index, layout)| {
-            if selecting {
-                vec![
-                    InlineKeyboardButton::callback(
-                        layout.name.clone(),
-                        format!("layout:select:{index}"),
-                    ),
-                    InlineKeyboardButton::callback("✏️", format!("layout:edit-select:{index}")),
-                ]
-            } else {
-                vec![
-                    InlineKeyboardButton::callback(
-                        layout.name.clone(),
-                        format!("layout:edit:{index}"),
-                    ),
-                    InlineKeyboardButton::callback("✏️", format!("layout:edit:{index}")),
-                ]
-            }
+            vec![
+                InlineKeyboardButton::callback(
+                    layout.name.clone(),
+                    format!("layout:select:{index}"),
+                ),
+                InlineKeyboardButton::callback("✏️", format!("layout:edit:{index}")),
+            ]
         })
         .collect::<Vec<_>>();
-    if !selecting {
-        rows.push(vec![InlineKeyboardButton::callback(
-            "Create layout",
-            "layout:create",
-        )]);
-    }
+    rows.push(vec![InlineKeyboardButton::callback(
+        "Sort by category priority",
+        "layout:priority",
+    )]);
+    rows.push(vec![InlineKeyboardButton::callback(
+        "Create layout",
+        "layout:create",
+    )]);
     rows.push(vec![InlineKeyboardButton::callback("Back", "layout:back")]);
     InlineKeyboardMarkup::new(rows)
 }
@@ -883,32 +852,26 @@ async fn command_handler(
 
         Command::Categorize => {
             let layouts = store.lock().await.layouts(chat_id)?;
-            if layouts.is_empty() {
-                store.lock().await.sort_items_by_category(chat_id).await?;
-                bot.send_message(chat_id, "Sorted items by category priority")
-                    .await?;
-            } else {
-                let sent = bot
-                    .send_message(chat_id, layouts_text(&layouts, true))
-                    .reply_markup(layouts_keyboard(&layouts, true))
-                    .await?;
-                let generation = generation();
-                sessions.lock().await.insert(
-                    chat_id.0,
-                    Session::Layout {
-                        message_id: sent.id,
-                        generation,
-                        mode: LayoutMode::Select,
-                    },
-                );
-                tokio::spawn(expire_session(
-                    bot.clone(),
-                    sessions.clone(),
-                    chat_id,
+            let sent = bot
+                .send_message(chat_id, layouts_text(&layouts))
+                .reply_markup(layouts_keyboard(&layouts))
+                .await?;
+            let generation = generation();
+            sessions.lock().await.insert(
+                chat_id.0,
+                Session::Layout {
+                    message_id: sent.id,
                     generation,
-                    LAYOUT_TIMEOUT,
-                ));
-            }
+                    mode: LayoutMode::Select,
+                },
+            );
+            tokio::spawn(expire_session(
+                bot.clone(),
+                sessions.clone(),
+                chat_id,
+                generation,
+                LAYOUT_TIMEOUT,
+            ));
         }
 
         Command::Cancel => {
@@ -944,30 +907,6 @@ async fn command_handler(
                 chat_id,
                 generation,
                 CATEGORY_TIMEOUT,
-            ));
-        }
-
-        Command::Layouts => {
-            let layouts = store.lock().await.layouts(chat_id)?;
-            let sent = bot
-                .send_message(chat_id, layouts_text(&layouts, false))
-                .reply_markup(layouts_keyboard(&layouts, false))
-                .await?;
-            let generation = generation();
-            sessions.lock().await.insert(
-                chat_id.0,
-                Session::Layout {
-                    message_id: sent.id,
-                    generation,
-                    mode: LayoutMode::Main,
-                },
-            );
-            tokio::spawn(expire_session(
-                bot.clone(),
-                sessions.clone(),
-                chat_id,
-                generation,
-                LAYOUT_TIMEOUT,
             ));
         }
 
@@ -1181,7 +1120,6 @@ async fn text_handler(
                     name: layout.name.clone(),
                     categories: layout.categories.clone(),
                     moving: None,
-                    return_to: LayoutReturn::Main,
                 },
                 layout_arrange_text(&layout.name, &layout.categories, None),
                 layout_arrange_keyboard(&layout.categories, None),
@@ -1192,7 +1130,7 @@ async fn text_handler(
         Some(Session::Layout {
             message_id,
             generation,
-            mode: LayoutMode::Rename { name, return_to },
+            mode: LayoutMode::Rename { name },
         }) => {
             let new_name = text.trim();
             if new_name.is_empty() {
@@ -1218,7 +1156,7 @@ async fn text_handler(
                 return Ok(());
             }
             show_layout_manage(
-                &bot, &store, &sessions, chat_id, message_id, generation, new_name, return_to,
+                &bot, &store, &sessions, chat_id, message_id, generation, new_name,
             )
             .await?;
         }
@@ -1372,7 +1310,6 @@ async fn show_layout_list(
     chat_id: ChatId,
     message_id: MessageId,
     generation: u64,
-    selecting: bool,
 ) -> Result<()> {
     let layouts = store.lock().await.layouts(chat_id)?;
     set_layout_view(
@@ -1381,13 +1318,9 @@ async fn show_layout_list(
         chat_id,
         message_id,
         generation,
-        if selecting {
-            LayoutMode::Select
-        } else {
-            LayoutMode::Main
-        },
-        layouts_text(&layouts, selecting),
-        layouts_keyboard(&layouts, selecting),
+        LayoutMode::Select,
+        layouts_text(&layouts),
+        layouts_keyboard(&layouts),
     )
     .await
 }
@@ -1400,7 +1333,6 @@ async fn show_layout_manage(
     message_id: MessageId,
     generation: u64,
     name: &str,
-    return_to: LayoutReturn,
 ) -> Result<()> {
     let layout = store
         .lock()
@@ -1417,7 +1349,6 @@ async fn show_layout_manage(
         generation,
         LayoutMode::Manage {
             name: layout.name.clone(),
-            return_to,
         },
         format!("Edit layout: {}", layout.name),
         layout_management_keyboard(),
@@ -1461,44 +1392,19 @@ async fn layout_callback(
         "back" => {
             bot.answer_callback_query(query_id).await?;
             match mode {
-                LayoutMode::Main => {
+                LayoutMode::Select => {
                     bot.edit_message_reply_markup(chat_id, message_id)
                         .reply_markup(InlineKeyboardMarkup::default())
                         .await?;
                     sessions.lock().await.remove(&chat_id.0);
                 }
-                LayoutMode::Select => {
-                    if store.lock().await.layouts(chat_id)?.is_empty() {
-                        store.lock().await.sort_items_by_category(chat_id).await?;
-                        bot.edit_message_text(
-                            chat_id,
-                            message_id,
-                            "Sorted items by category priority",
-                        )
-                        .reply_markup(InlineKeyboardMarkup::default())
+                LayoutMode::Manage { .. } => {
+                    show_layout_list(&bot, &store, &sessions, chat_id, message_id, generation)
                         .await?;
-                    } else {
-                        bot.edit_message_reply_markup(chat_id, message_id)
-                            .reply_markup(InlineKeyboardMarkup::default())
-                            .await?;
-                    }
-                    sessions.lock().await.remove(&chat_id.0);
                 }
-                LayoutMode::Manage { return_to, .. } => {
-                    show_layout_list(
-                        &bot,
-                        &store,
-                        &sessions,
-                        chat_id,
-                        message_id,
-                        generation,
-                        matches!(return_to, LayoutReturn::Select),
-                    )
-                    .await?;
-                }
-                LayoutMode::Rename { name, return_to } => {
+                LayoutMode::Rename { name } => {
                     show_layout_manage(
-                        &bot, &store, &sessions, chat_id, message_id, generation, &name, return_to,
+                        &bot, &store, &sessions, chat_id, message_id, generation, &name,
                     )
                     .await?;
                 }
@@ -1506,7 +1412,6 @@ async fn layout_callback(
                     name,
                     categories,
                     moving: Some(_),
-                    return_to,
                 } => {
                     set_layout_view(
                         &bot,
@@ -1518,31 +1423,25 @@ async fn layout_callback(
                             name: name.clone(),
                             categories: categories.clone(),
                             moving: None,
-                            return_to,
                         },
                         layout_arrange_text(&name, &categories, None),
                         layout_arrange_keyboard(&categories, None),
                     )
                     .await?;
                 }
-                LayoutMode::Arrange {
-                    name, return_to, ..
-                }
-                | LayoutMode::ConfirmDelete { name, return_to } => {
+                LayoutMode::Arrange { name, .. } | LayoutMode::ConfirmDelete { name } => {
                     show_layout_manage(
-                        &bot, &store, &sessions, chat_id, message_id, generation, &name, return_to,
+                        &bot, &store, &sessions, chat_id, message_id, generation, &name,
                     )
                     .await?;
                 }
                 LayoutMode::CreateName => {
-                    show_layout_list(
-                        &bot, &store, &sessions, chat_id, message_id, generation, false,
-                    )
-                    .await?;
+                    show_layout_list(&bot, &store, &sessions, chat_id, message_id, generation)
+                        .await?;
                 }
             }
         }
-        "create" if matches!(mode, LayoutMode::Main) => {
+        "create" if matches!(mode, LayoutMode::Select) => {
             bot.answer_callback_query(query_id).await?;
             set_layout_view(
                 &bot,
@@ -1559,13 +1458,8 @@ async fn layout_callback(
             )
             .await?;
         }
-        action if action.starts_with("edit:") || action.starts_with("edit-select:") => {
-            let return_to = if action.starts_with("edit-select:") {
-                LayoutReturn::Select
-            } else {
-                LayoutReturn::Main
-            };
-            if !matches!(mode, LayoutMode::Main | LayoutMode::Select) {
+        action if action.starts_with("edit:") && matches!(mode, LayoutMode::Select) => {
+            if !matches!(mode, LayoutMode::Select) {
                 bot.answer_callback_query(query_id)
                     .text("Choose a layout first")
                     .await?;
@@ -1584,7 +1478,7 @@ async fn layout_callback(
             let name = layout.name.clone();
             bot.answer_callback_query(query_id).await?;
             show_layout_manage(
-                &bot, &store, &sessions, chat_id, message_id, generation, &name, return_to,
+                &bot, &store, &sessions, chat_id, message_id, generation, &name,
             )
             .await?;
         }
@@ -1617,8 +1511,18 @@ async fn layout_callback(
             .await?;
             sessions.lock().await.remove(&chat_id.0);
         }
+        "priority" if matches!(mode, LayoutMode::Select) => {
+            store.lock().await.sort_items_by_category(chat_id).await?;
+            bot.answer_callback_query(query_id)
+                .text("Sorted by category priority")
+                .await?;
+            bot.edit_message_text(chat_id, message_id, "Sorted items by category priority")
+                .reply_markup(InlineKeyboardMarkup::default())
+                .await?;
+            sessions.lock().await.remove(&chat_id.0);
+        }
         "rename" => {
-            let LayoutMode::Manage { name, return_to } = mode else {
+            let LayoutMode::Manage { name } = mode else {
                 bot.answer_callback_query(query_id)
                     .text("Choose a layout to rename first")
                     .await?;
@@ -1631,10 +1535,7 @@ async fn layout_callback(
                 chat_id,
                 message_id,
                 generation,
-                LayoutMode::Rename {
-                    name: name.clone(),
-                    return_to,
-                },
+                LayoutMode::Rename { name: name.clone() },
                 format!("Send a new name for {name}:"),
                 InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
                     "Back",
@@ -1644,7 +1545,7 @@ async fn layout_callback(
             .await?;
         }
         "arrange" => {
-            let LayoutMode::Manage { name, return_to } = mode else {
+            let LayoutMode::Manage { name } = mode else {
                 bot.answer_callback_query(query_id)
                     .text("Choose a layout to re-arrange first")
                     .await?;
@@ -1668,7 +1569,6 @@ async fn layout_callback(
                     name: name.clone(),
                     categories: layout.categories.clone(),
                     moving: None,
-                    return_to,
                 },
                 layout_arrange_text(&name, &layout.categories, None),
                 layout_arrange_keyboard(&layout.categories, None),
@@ -1676,7 +1576,7 @@ async fn layout_callback(
             .await?;
         }
         "delete" => {
-            let LayoutMode::Manage { name, return_to } = mode else {
+            let LayoutMode::Manage { name } = mode else {
                 bot.answer_callback_query(query_id)
                     .text("Choose a layout to delete first")
                     .await?;
@@ -1689,17 +1589,14 @@ async fn layout_callback(
                 chat_id,
                 message_id,
                 generation,
-                LayoutMode::ConfirmDelete {
-                    name: name.clone(),
-                    return_to,
-                },
+                LayoutMode::ConfirmDelete { name: name.clone() },
                 format!("Delete layout {name:?}?"),
                 layout_confirmation_keyboard(),
             )
             .await?;
         }
         "confirm-delete" => {
-            let LayoutMode::ConfirmDelete { name, return_to } = mode else {
+            let LayoutMode::ConfirmDelete { name } = mode else {
                 bot.answer_callback_query(query_id)
                     .text("Choose a layout to delete first")
                     .await?;
@@ -1709,25 +1606,16 @@ async fn layout_callback(
             bot.answer_callback_query(query_id)
                 .text("Layout deleted")
                 .await?;
-            show_layout_list(
-                &bot,
-                &store,
-                &sessions,
-                chat_id,
-                message_id,
-                generation,
-                matches!(return_to, LayoutReturn::Select),
-            )
-            .await?;
+            show_layout_list(&bot, &store, &sessions, chat_id, message_id, generation).await?;
         }
         "cancel-delete" => {
-            let LayoutMode::ConfirmDelete { name, return_to } = mode else {
+            let LayoutMode::ConfirmDelete { name } = mode else {
                 bot.answer_callback_query(query_id).await?;
                 return Ok(());
             };
             bot.answer_callback_query(query_id).await?;
             show_layout_manage(
-                &bot, &store, &sessions, chat_id, message_id, generation, &name, return_to,
+                &bot, &store, &sessions, chat_id, message_id, generation, &name,
             )
             .await?;
         }
@@ -1736,7 +1624,6 @@ async fn layout_callback(
                 name,
                 categories,
                 moving: None,
-                return_to,
             } = mode
             else {
                 bot.answer_callback_query(query_id)
@@ -1766,7 +1653,6 @@ async fn layout_callback(
                     name: name.clone(),
                     categories: categories.clone(),
                     moving: Some(index),
-                    return_to,
                 },
                 layout_arrange_text(&name, &categories, Some(index)),
                 layout_arrange_keyboard(&categories, Some(index)),
@@ -1778,7 +1664,6 @@ async fn layout_callback(
                 name,
                 mut categories,
                 moving: Some(moving),
-                return_to,
             } = mode
             else {
                 bot.answer_callback_query(query_id)
@@ -1818,7 +1703,6 @@ async fn layout_callback(
                     name: name.clone(),
                     categories: categories.clone(),
                     moving: None,
-                    return_to,
                 },
                 layout_arrange_text(&name, &categories, None),
                 layout_arrange_keyboard(&categories, None),
@@ -1830,7 +1714,6 @@ async fn layout_callback(
                 name,
                 categories,
                 moving: Some(_),
-                return_to,
             } = mode
             else {
                 bot.answer_callback_query(query_id).await?;
@@ -1847,7 +1730,6 @@ async fn layout_callback(
                     name: name.clone(),
                     categories: categories.clone(),
                     moving: None,
-                    return_to,
                 },
                 layout_arrange_text(&name, &categories, None),
                 layout_arrange_keyboard(&categories, None),
@@ -1855,10 +1737,7 @@ async fn layout_callback(
             .await?;
         }
         "done" => {
-            let LayoutMode::Arrange {
-                name, return_to, ..
-            } = mode
-            else {
+            let LayoutMode::Arrange { name, .. } = mode else {
                 bot.answer_callback_query(query_id)
                     .text("No layout is being arranged")
                     .await?;
@@ -1866,7 +1745,7 @@ async fn layout_callback(
             };
             bot.answer_callback_query(query_id).await?;
             show_layout_manage(
-                &bot, &store, &sessions, chat_id, message_id, generation, &name, return_to,
+                &bot, &store, &sessions, chat_id, message_id, generation, &name,
             )
             .await?;
         }
@@ -3057,5 +2936,19 @@ mod tests {
         assert_eq!(rows[1][0]["text"].as_str(), Some("DONE"));
         assert_eq!(rows[1][0]["callback_data"].as_str(), Some("revive:done"));
         assert!(super::revive_keyboard(&items[..1]).is_none());
+    }
+
+    #[test]
+    fn categorize_menu_offers_priority_sort_and_layout_creation_without_existing_layouts() {
+        let keyboard = serde_json::to_value(super::layouts_keyboard(&[])).unwrap();
+        let rows = keyboard["inline_keyboard"].as_array().unwrap();
+
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows[0][0]["callback_data"].as_str(),
+            Some("layout:priority")
+        );
+        assert_eq!(rows[1][0]["callback_data"].as_str(), Some("layout:create"));
+        assert_eq!(rows[2][0]["callback_data"].as_str(), Some("layout:back"));
     }
 }
