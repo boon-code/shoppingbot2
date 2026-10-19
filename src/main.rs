@@ -1494,31 +1494,45 @@ async fn layout_callback(
                 return Ok(());
             };
             let name = layout.name.clone();
-            store
-                .lock()
-                .await
-                .sort_items_by_layout(chat_id, &name)
-                .await?;
+            let items = {
+                let mut store = store.lock().await;
+                store.sort_items_by_layout(chat_id, &name).await?;
+                store.items(chat_id).await?
+            };
             bot.answer_callback_query(query_id)
                 .text(format!("Sorted by {name}"))
                 .await?;
             bot.edit_message_text(
                 chat_id,
                 message_id,
-                format!("Sorted items by layout {name}"),
+                format!(
+                    "Sorted items by layout {name}\n\n{}",
+                    checklist_text(&items)
+                ),
             )
             .reply_markup(InlineKeyboardMarkup::default())
             .await?;
             sessions.lock().await.remove(&chat_id.0);
         }
         "priority" if matches!(mode, LayoutMode::Select) => {
-            store.lock().await.sort_items_by_category(chat_id).await?;
+            let items = {
+                let mut store = store.lock().await;
+                store.sort_items_by_category(chat_id).await?;
+                store.items(chat_id).await?
+            };
             bot.answer_callback_query(query_id)
                 .text("Sorted by category priority")
                 .await?;
-            bot.edit_message_text(chat_id, message_id, "Sorted items by category priority")
-                .reply_markup(InlineKeyboardMarkup::default())
-                .await?;
+            bot.edit_message_text(
+                chat_id,
+                message_id,
+                format!(
+                    "Sorted items by category priority\n\n{}",
+                    checklist_text(&items)
+                ),
+            )
+            .reply_markup(InlineKeyboardMarkup::default())
+            .await?;
             sessions.lock().await.remove(&chat_id.0);
         }
         "rename" => {
