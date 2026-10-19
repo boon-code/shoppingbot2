@@ -46,6 +46,12 @@ pub struct Category {
     pub priority: i32,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Layout {
+    pub name: String,
+    pub categories: Vec<String>,
+}
+
 struct CacheEntry {
     items: Arc<Vec<Item>>,
     next_id: u64,
@@ -275,14 +281,14 @@ impl Store {
     }
 
     pub async fn sort_items_by_category(&mut self, chat_id: ChatId) -> Result<()> {
-        let mut category_priorities = HashMap::new();
+        let mut category_order = HashMap::new();
         for category in self.categories(chat_id)? {
             for item in category.items {
                 let canonical = normalize_history_text(&item);
                 if canonical.is_empty() {
                     continue;
                 }
-                category_priorities
+                category_order
                     .entry(canonical)
                     .and_modify(|priority: &mut i32| *priority = (*priority).min(category.priority))
                     .or_insert(category.priority);
@@ -293,11 +299,196 @@ impl Store {
         let entry = self.cache.get_mut(&chat_key).expect("cached list exists");
         let items = Arc::make_mut(&mut entry.items);
         items.sort_by_key(|item| {
-            let priority = category_priorities.get(&normalize_history_text(&item.item));
+            let priority = category_order.get(&normalize_history_text(&item.item));
             (priority.is_none(), priority.copied().unwrap_or_default())
         });
         let items = Arc::clone(&entry.items);
         self.queue_save(chat_key, items)
+    }
+
+    pub async fn sort_items_by_layout(&mut self, chat_id: ChatId, name: &str) -> Result<()> {
+        let layout = self
+            .layouts(chat_id)?
+            .into_iter()
+            .find(|layout| layout.name == name)
+            .with_context(|| format!("layout {name:?} does not exist"))?;
+        let categories = self.categories(chat_id)?;
+        let mut category_order = HashMap::new();
+        for (order, category_name) in layout.categories.iter().enumerate() {
+            if let Some(category) = categories
+                .iter()
+                .find(|category| category.name == *category_name)
+            {
+                for item in &category.items {
+                    let canonical = normalize_history_text(item);
+                    if canonical.is_empty() {
+                        continue;
+                    }
+                    category_order
+                        .entry(canonical)
+                        .and_modify(|current: &mut usize| *current = (*current).min(order))
+                        .or_insert(order);
+                }
+            }
+        }
+
+        let chat_key = self.ensure_cached(chat_id).await?;
+        let entry = self.cache.get_mut(&chat_key).expect("cached list exists");
+        let items = Arc::make_mut(&mut entry.items);
+        items.sort_by_key(|item| {
+            let order = category_order.get(&normalize_history_text(&item.item));
+            (order.is_none(), order.copied().unwrap_or_default())
+        });
+        let items = Arc::clone(&entry.items);
+        self.queue_save(chat_key, items)
+    }
+
+    pub fn layouts(&self, chat_id: ChatId) -> Result<Vec<Layout>> {
+        let directory = self
+            .path
+            .join(categories_directory_name(&chat_id.0.to_string()));
+        if !directory.exists() {
+            return Ok(Vec::new());
+        }
+        let categories = self.categories(chat_id)?;
+        let category_names = categories
+            .iter()
+            .map(|category| category.name.clone())
+            .collect::<Vec<_>>();
+        let mut layouts = fs::read_dir(&directory)
+            .with_context(|| format!("failed to read {}", directory.display()))?
+            .map(|entry| {
+                let entry =
+                    entry.with_context(|| format!("failed to read {}", directory.display()))?;
+                let path = entry.path();
+                if !path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("layout_") && name.ends_with(".json"))
+                {
+                    return Ok(None);
+                }
+                let name = layout_name_from_path(&path)
+                    .with_context(|| format!("invalid layout filename {}", path.display()))?;
+                let contents = fs::read(&path)
+                    .with_context(|| format!("failed to read {}", path.display()))?;
+                let stored: Vec<String> = serde_json::from_slice(&contents)
+                    .with_context(|| format!("invalid layout {}", path.display()))?;
+                Ok(Some(Layout {
+                    name,
+                    categories: stored,
+                }))
+            })
+            .collect::<Result<Vec<Option<Layout>>>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        layouts.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+
+        for layout in &mut layouts {
+            let normalized = normalize_layout_categories(&layout.categories, &category_names);
+            if normalized != layout.categories {
+                self.write_layout(chat_id, &layout.name, &normalized)?;
+                layout.categories = normalized;
+            }
+        }
+        Ok(layouts)
+    }
+
+    pub fn create_layout(&self, chat_id: ChatId, name: &str) -> Result<Layout> {
+        let name = name.trim();
+        if name.is_empty() {
+            bail!("layout name cannot be empty");
+        }
+        if self
+            .layouts(chat_id)?
+            .iter()
+            .any(|layout| layout.name.eq_ignore_ascii_case(name))
+        {
+            bail!("layout already exists");
+        }
+        let categories = self
+            .categories(chat_id)?
+            .into_iter()
+            .map(|category| category.name)
+            .collect::<Vec<_>>();
+        self.write_layout(chat_id, name, &categories)?;
+        Ok(Layout {
+            name: name.to_string(),
+            categories,
+        })
+    }
+
+    pub fn save_layout(&self, chat_id: ChatId, name: &str, categories: &[String]) -> Result<()> {
+        let current = self
+            .layouts(chat_id)?
+            .into_iter()
+            .find(|layout| layout.name == name)
+            .with_context(|| format!("layout {name:?} does not exist"))?;
+        let valid_categories = self
+            .categories(chat_id)?
+            .into_iter()
+            .map(|category| category.name)
+            .collect::<Vec<_>>();
+        let normalized = normalize_layout_categories(categories, &valid_categories);
+        self.write_layout(chat_id, &current.name, &normalized)
+    }
+
+    pub fn rename_layout(&self, chat_id: ChatId, name: &str, new_name: &str) -> Result<()> {
+        let new_name = new_name.trim();
+        if new_name.is_empty() {
+            bail!("layout name cannot be empty");
+        }
+        let layouts = self.layouts(chat_id)?;
+        let layout = layouts
+            .iter()
+            .find(|layout| layout.name == name)
+            .with_context(|| format!("layout {name:?} does not exist"))?;
+        if layouts
+            .iter()
+            .any(|layout| layout.name != name && layout.name.eq_ignore_ascii_case(new_name))
+        {
+            bail!("layout already exists");
+        }
+        let directory = self
+            .path
+            .join(categories_directory_name(&chat_id.0.to_string()));
+        let old_file = directory.join(layout_file_name(name));
+        let new_file = directory.join(layout_file_name(new_name));
+        if old_file != new_file {
+            let data = serde_json::to_vec_pretty(&layout.categories)
+                .context("failed to serialize shop layout")?;
+            write_file_atomically(&directory, &new_file, &data)?;
+            fs::remove_file(&old_file)
+                .with_context(|| format!("failed to remove {}", old_file.display()))?;
+            sync_directory(&directory)?;
+        }
+        Ok(())
+    }
+
+    pub fn delete_layout(&self, chat_id: ChatId, name: &str) -> Result<()> {
+        let layout = self
+            .layouts(chat_id)?
+            .into_iter()
+            .find(|layout| layout.name == name)
+            .with_context(|| format!("layout {name:?} does not exist"))?;
+        let directory = self
+            .path
+            .join(categories_directory_name(&chat_id.0.to_string()));
+        let file = directory.join(layout_file_name(&layout.name));
+        fs::remove_file(&file).with_context(|| format!("failed to remove {}", file.display()))?;
+        sync_directory(&directory)
+    }
+
+    fn write_layout(&self, chat_id: ChatId, name: &str, categories: &[String]) -> Result<()> {
+        let directory = self
+            .path
+            .join(categories_directory_name(&chat_id.0.to_string()));
+        fs::create_dir_all(&directory)
+            .with_context(|| format!("failed to create {}", directory.display()))?;
+        let data =
+            serde_json::to_vec_pretty(categories).context("failed to serialize shop layout")?;
+        write_file_atomically(&directory, &directory.join(layout_file_name(name)), &data)
     }
 
     pub async fn history_items(&mut self, chat_id: ChatId) -> Result<Vec<(String, u64)>> {
@@ -329,6 +520,7 @@ impl Store {
             priority: 0,
         };
         write_category(&self.path, chat_id, &category)?;
+        self.layouts(chat_id)?;
         Ok(category)
     }
 
@@ -365,23 +557,36 @@ impl Store {
             .path
             .join(categories_directory_name(&chat_id.0.to_string()))
             .join(category_file_name(&category.name));
-        category.name = new_name.to_string();
-        write_category(&self.path, chat_id, &category)?;
-
-        let new_file = old_file
+        let directory = old_file
             .parent()
             .context("category file path has no parent")?
-            .join(category_file_name(&category.name));
-        if old_file != new_file {
-            fs::remove_file(&old_file)
-                .with_context(|| format!("failed to remove {}", old_file.display()))?;
-            sync_directory(
-                old_file
-                    .parent()
-                    .context("category file path has no parent")?,
-            )?;
+            .to_path_buf();
+        let mut layouts = self.layouts(chat_id)?;
+        for layout in &mut layouts {
+            for name in &mut layout.categories {
+                if name == &category.name {
+                    *name = new_name.to_string();
+                }
+            }
         }
-        Ok(())
+        category.name = new_name.to_string();
+        let new_file = directory.join(category_file_name(&category.name));
+        let category_data = serde_json::to_vec_pretty(&category)
+            .context("failed to serialize shopping category")?;
+        let mut updates = vec![(new_file.clone(), Some(category_data))];
+        for layout in layouts {
+            updates.push((
+                directory.join(layout_file_name(&layout.name)),
+                Some(
+                    serde_json::to_vec_pretty(&layout.categories)
+                        .context("failed to serialize shop layout")?,
+                ),
+            ));
+        }
+        if old_file != new_file {
+            updates.push((old_file, None));
+        }
+        replace_files_atomically(&directory, updates)
     }
 
     pub fn add_category_item(
@@ -425,7 +630,9 @@ impl Store {
             .join(categories_directory_name(&chat_id.0.to_string()));
         let file = path.join(category_file_name(&category.name));
         fs::remove_file(&file).with_context(|| format!("failed to remove {}", file.display()))?;
-        sync_directory(&path)
+        sync_directory(&path)?;
+        self.layouts(chat_id)?;
+        Ok(())
     }
 
     fn category(&self, chat_id: ChatId, category_name: &str) -> Result<Category> {
@@ -749,12 +956,181 @@ fn category_file_name(name: &str) -> String {
     format!("category_{}.json", hex_encode(&name.to_lowercase()))
 }
 
+fn layout_file_name(name: &str) -> String {
+    format!("layout_{}.json", hex_encode(name))
+}
+
+fn layout_name_from_path(path: &Path) -> Result<String> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("layout filename is not valid UTF-8")?;
+    let encoded = file_name
+        .strip_prefix("layout_")
+        .and_then(|name| name.strip_suffix(".json"))
+        .context("layout filename has an invalid format")?;
+    if encoded.len() % 2 != 0 || !encoded.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("layout filename contains invalid hex");
+    }
+    let bytes = encoded
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            u8::from_str_radix(std::str::from_utf8(pair).expect("ASCII hex"), 16)
+                .context("layout filename contains invalid hex")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    String::from_utf8(bytes).context("layout name is not valid UTF-8")
+}
+
 fn hex_encode(value: &str) -> String {
     value
         .as_bytes()
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+fn normalize_layout_categories(stored: &[String], categories: &[String]) -> Vec<String> {
+    let mut normalized = stored
+        .iter()
+        .filter(|name| categories.iter().any(|category| category == *name))
+        .fold(Vec::new(), |mut result, name| {
+            if !result.contains(name) {
+                result.push(name.clone());
+            }
+            result
+        });
+    for category in categories {
+        if !normalized.contains(category) {
+            normalized.push(category.clone());
+        }
+    }
+    normalized
+}
+
+fn replace_files_atomically(
+    directory: &Path,
+    updates: Vec<(PathBuf, Option<Vec<u8>>)>,
+) -> Result<()> {
+    let mut staged = Vec::new();
+    let mut originals = Vec::new();
+    let staging = (|| -> Result<()> {
+        for (index, (destination, contents)) in updates.iter().enumerate() {
+            if destination.parent() != Some(directory) {
+                bail!("transaction file is outside {}", directory.display());
+            }
+            let original = match fs::read(destination) {
+                Ok(contents) => Some(contents),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to read {}", destination.display()));
+                }
+            };
+            originals.push((destination.clone(), original));
+            if let Some(contents) = contents {
+                let file_name = destination
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .context("transaction filename is not valid UTF-8")?;
+                let temporary = directory.join(format!(".tmp_txn_{index}_{file_name}"));
+                staged.push((temporary.clone(), destination.clone()));
+                let mut file = OpenOptions::new()
+                    .create(true)
+                    .truncate(true)
+                    .write(true)
+                    .open(&temporary)
+                    .with_context(|| format!("failed to create {}", temporary.display()))?;
+                file.write_all(contents)
+                    .and_then(|()| file.sync_all())
+                    .with_context(|| format!("failed to sync {}", temporary.display()))?;
+            }
+        }
+        Ok(())
+    })();
+    if let Err(error) = staging {
+        for (temporary, _) in staged {
+            let _ = fs::remove_file(temporary);
+        }
+        return Err(error);
+    }
+
+    let commit = (|| -> Result<()> {
+        let mut staged_index = 0;
+        for (destination, contents) in &updates {
+            if contents.is_some() {
+                let (temporary, staged_destination) = &staged[staged_index];
+                debug_assert_eq!(staged_destination, destination);
+                fs::rename(temporary, destination).with_context(|| {
+                    format!(
+                        "failed to replace {} with {}",
+                        destination.display(),
+                        temporary.display()
+                    )
+                })?;
+                staged_index += 1;
+            } else if destination.exists() {
+                fs::remove_file(destination)
+                    .with_context(|| format!("failed to remove {}", destination.display()))?;
+            }
+        }
+        sync_directory(directory)
+    })();
+    if let Err(error) = commit {
+        let mut rollback_errors = Vec::new();
+        for (destination, original) in originals {
+            let result = match original {
+                Some(contents) => write_file_atomically(directory, &destination, &contents),
+                None => match fs::remove_file(&destination) {
+                    Ok(()) => Ok(()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(error) => Err(error)
+                        .with_context(|| format!("failed to remove {}", destination.display())),
+                },
+            };
+            if let Err(rollback_error) = result {
+                rollback_errors.push(format!("{rollback_error:#}"));
+            }
+        }
+        for (temporary, _) in staged {
+            let _ = fs::remove_file(temporary);
+        }
+        if rollback_errors.is_empty() {
+            return Err(error).context("file transaction failed and was rolled back");
+        }
+        bail!(
+            "file transaction failed: {error:#}; rollback errors: {}",
+            rollback_errors.join("; ")
+        );
+    }
+    Ok(())
+}
+
+fn write_file_atomically(directory: &Path, destination: &Path, data: &[u8]) -> Result<()> {
+    let file_name = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("destination filename is not valid UTF-8")?;
+    let temporary = directory.join(format!(".tmp_{file_name}"));
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temporary)
+        .with_context(|| format!("failed to create {}", temporary.display()))?;
+    file.write_all(data)
+        .and_then(|()| file.sync_all())
+        .with_context(|| format!("failed to sync {}", temporary.display()))?;
+    drop(file);
+    fs::rename(&temporary, destination).with_context(|| {
+        format!(
+            "failed to replace {} with {}",
+            destination.display(),
+            temporary.display()
+        )
+    })?;
+    sync_directory(directory)
 }
 
 fn write_category(directory: &Path, chat_id: ChatId, category: &Category) -> Result<()> {
@@ -1235,6 +1611,96 @@ mod tests {
                 .is_err()
         );
 
+        store.shutdown().unwrap();
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn layouts_follow_category_renames_and_append_new_categories() {
+        let directory = test_directory("layout-category-consistency");
+        let store = Store::load(&directory).await.unwrap();
+        let chat_id = ChatId(1234);
+        store.create_category(chat_id, "First").unwrap();
+        store.create_category(chat_id, "Second").unwrap();
+        store.set_category_priority(chat_id, "First", 3).unwrap();
+        store.set_category_priority(chat_id, "Second", 1).unwrap();
+        let layout = store.create_layout(chat_id, "Weekly shop").unwrap();
+        assert_eq!(layout.categories, vec!["Second", "First"]);
+        assert!(
+            directory
+                .join("categories_31323334")
+                .join("layout_5765656b6c792073686f70.json")
+                .exists()
+        );
+
+        store
+            .save_layout(
+                chat_id,
+                "Weekly shop",
+                &["First".to_string(), "Second".to_string()],
+            )
+            .unwrap();
+        store.create_category(chat_id, "Third").unwrap();
+        store.rename_category(chat_id, "Second", "Renamed").unwrap();
+        assert_eq!(
+            store.layouts(chat_id).unwrap()[0].categories,
+            vec!["First", "Renamed", "Third"]
+        );
+
+        let layout_path = directory
+            .join("categories_31323334")
+            .join("layout_5765656b6c792073686f70.json");
+        fs::write(&layout_path, r#"["stale","Third","Third"]"#).unwrap();
+        assert_eq!(
+            store.layouts(chat_id).unwrap()[0].categories,
+            vec!["Third", "Renamed", "First"]
+        );
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn sorts_items_by_layout_order_and_keeps_unmatched_items_stable() {
+        let directory = test_directory("sort-by-layout");
+        let mut store = Store::load(&directory).await.unwrap();
+        let chat_id = ChatId(1234);
+        store.create_category(chat_id, "First").unwrap();
+        store.create_category(chat_id, "Second").unwrap();
+        store.set_category_priority(chat_id, "First", 10).unwrap();
+        store.set_category_priority(chat_id, "Second", -10).unwrap();
+        store.add_category_item(chat_id, "First", "Apples").unwrap();
+        store.add_category_item(chat_id, "Second", "Bread").unwrap();
+        store.create_layout(chat_id, "Custom").unwrap();
+        store
+            .save_layout(
+                chat_id,
+                "Custom",
+                &["First".to_string(), "Second".to_string()],
+            )
+            .unwrap();
+        store
+            .add_items(
+                chat_id,
+                vec![
+                    "Bread".to_string(),
+                    "unmatched one".to_string(),
+                    "Apples".to_string(),
+                    "unmatched two".to_string(),
+                ],
+            )
+            .await
+            .unwrap();
+        store.sort_items_by_layout(chat_id, "Custom").await.unwrap();
+        let items = store.items(chat_id).await.unwrap();
+        let names = items
+            .iter()
+            .map(|item| item.item.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec!["Apples", "Bread", "unmatched one", "unmatched two"]
+        );
         store.shutdown().unwrap();
         drop(store);
         fs::remove_dir_all(directory).unwrap();

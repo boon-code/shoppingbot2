@@ -10,7 +10,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use db::{Category, Item, Store};
+use db::{Category, Item, Layout, Store};
 use log::{debug, info, warn};
 use teloxide::{
     dispatching::UpdateFilterExt,
@@ -31,6 +31,7 @@ const SWAP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const REORDER_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const REVIVE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const CATEGORY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const LAYOUT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 type SharedStore = Arc<Mutex<Store>>;
 type SharedSessions = Arc<Mutex<HashMap<i64, Session>>>;
@@ -84,8 +85,11 @@ enum Command {
     #[command(description = "Reorder items on list")]
     Reorder,
 
-    #[command(description = "Sort items by category priority")]
+    #[command(description = "Sort items by category or shop layout")]
     Categorize,
+
+    #[command(description = "Manage shop layouts")]
+    Layouts,
 
     #[command(description = "Remove checked items from list")]
     Cleanup,
@@ -138,6 +142,43 @@ enum Session {
         generation: u64,
         mode: CategoryMode,
     },
+
+    Layout {
+        message_id: MessageId,
+        generation: u64,
+        mode: LayoutMode,
+    },
+}
+
+#[derive(Clone, Debug)]
+enum LayoutReturn {
+    Main,
+    Select,
+}
+
+#[derive(Clone, Debug)]
+enum LayoutMode {
+    Main,
+    Select,
+    CreateName,
+    Manage {
+        name: String,
+        return_to: LayoutReturn,
+    },
+    Rename {
+        name: String,
+        return_to: LayoutReturn,
+    },
+    Arrange {
+        name: String,
+        categories: Vec<String>,
+        moving: Option<usize>,
+        return_to: LayoutReturn,
+    },
+    ConfirmDelete {
+        name: String,
+        return_to: LayoutReturn,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -164,7 +205,8 @@ impl Session {
             | Session::Swap { generation, .. }
             | Session::Reorder { generation, .. }
             | Session::Revive { generation, .. }
-            | Session::Category { generation, .. } => *generation,
+            | Session::Category { generation, .. }
+            | Session::Layout { generation, .. } => *generation,
         }
     }
 
@@ -174,7 +216,8 @@ impl Session {
             | Session::Swap { message_id, .. }
             | Session::Reorder { message_id, .. }
             | Session::Revive { message_id, .. }
-            | Session::Category { message_id, .. } => Some(*message_id),
+            | Session::Category { message_id, .. }
+            | Session::Layout { message_id, .. } => Some(*message_id),
             Session::Add { .. } | Session::Import { .. } => None,
         }
     }
@@ -279,6 +322,123 @@ fn categories_text(categories: &[Category]) -> String {
                 .join("\n")
         )
     }
+}
+
+fn layouts_text(layouts: &[Layout], selecting: bool) -> String {
+    if layouts.is_empty() {
+        return if selecting {
+            "No shop layouts are defined. Press Back to sort by category priority.".to_string()
+        } else {
+            "No shop layouts yet. Create one to get started.".to_string()
+        };
+    }
+    let intro = if selecting {
+        "Choose a shop layout to sort your list:"
+    } else {
+        "Shop layouts:"
+    };
+    format!(
+        "{intro}\n{}",
+        layouts
+            .iter()
+            .map(|layout| format!("• {}", layout.name))
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
+}
+
+fn layouts_keyboard(layouts: &[Layout], selecting: bool) -> InlineKeyboardMarkup {
+    let mut rows = layouts
+        .iter()
+        .enumerate()
+        .map(|(index, layout)| {
+            if selecting {
+                vec![
+                    InlineKeyboardButton::callback(
+                        layout.name.clone(),
+                        format!("layout:select:{index}"),
+                    ),
+                    InlineKeyboardButton::callback("✏️", format!("layout:edit-select:{index}")),
+                ]
+            } else {
+                vec![
+                    InlineKeyboardButton::callback(
+                        layout.name.clone(),
+                        format!("layout:edit:{index}"),
+                    ),
+                    InlineKeyboardButton::callback("✏️", format!("layout:edit:{index}")),
+                ]
+            }
+        })
+        .collect::<Vec<_>>();
+    if !selecting {
+        rows.push(vec![InlineKeyboardButton::callback(
+            "Create layout",
+            "layout:create",
+        )]);
+    }
+    rows.push(vec![InlineKeyboardButton::callback("Back", "layout:back")]);
+    InlineKeyboardMarkup::new(rows)
+}
+
+fn layout_management_keyboard() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![
+        vec![InlineKeyboardButton::callback("Rename", "layout:rename")],
+        vec![InlineKeyboardButton::callback(
+            "Re-arrange",
+            "layout:arrange",
+        )],
+        vec![InlineKeyboardButton::callback("Delete", "layout:delete")],
+        vec![InlineKeyboardButton::callback("Back", "layout:back")],
+    ])
+}
+
+fn layout_confirmation_keyboard() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![vec![
+        InlineKeyboardButton::callback("Delete", "layout:confirm-delete"),
+        InlineKeyboardButton::callback("Cancel", "layout:cancel-delete"),
+    ]])
+}
+
+fn layout_arrange_text(name: &str, categories: &[String], moving: Option<usize>) -> String {
+    let instruction = if moving.is_some() {
+        "Choose the category to place it after:"
+    } else {
+        "Choose a category to move, then choose the category to place it after:"
+    };
+    let order = categories
+        .iter()
+        .enumerate()
+        .map(|(index, category)| format!("{}. {category}", index + 1))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("Arrange layout {name}\n\n{instruction}\n\n{order}")
+}
+
+fn layout_arrange_keyboard(categories: &[String], moving: Option<usize>) -> InlineKeyboardMarkup {
+    let mut rows = categories
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| moving != Some(*index))
+        .map(|(index, category)| {
+            vec![InlineKeyboardButton::callback(
+                category.clone(),
+                if moving.is_some() {
+                    format!("layout:place:{index}")
+                } else {
+                    format!("layout:move:{index}")
+                },
+            )]
+        })
+        .collect::<Vec<_>>();
+    rows.push(vec![InlineKeyboardButton::callback("Done", "layout:done")]);
+    if moving.is_some() {
+        rows.push(vec![InlineKeyboardButton::callback(
+            "Back",
+            "layout:arrange-back",
+        )]);
+    }
+    InlineKeyboardMarkup::new(rows)
 }
 
 fn category_editor_text(category: &Category) -> String {
@@ -722,9 +882,33 @@ async fn command_handler(
         }
 
         Command::Categorize => {
-            store.lock().await.sort_items_by_category(chat_id).await?;
-            bot.send_message(chat_id, "Sorted items by category priority")
-                .await?;
+            let layouts = store.lock().await.layouts(chat_id)?;
+            if layouts.is_empty() {
+                store.lock().await.sort_items_by_category(chat_id).await?;
+                bot.send_message(chat_id, "Sorted items by category priority")
+                    .await?;
+            } else {
+                let sent = bot
+                    .send_message(chat_id, layouts_text(&layouts, true))
+                    .reply_markup(layouts_keyboard(&layouts, true))
+                    .await?;
+                let generation = generation();
+                sessions.lock().await.insert(
+                    chat_id.0,
+                    Session::Layout {
+                        message_id: sent.id,
+                        generation,
+                        mode: LayoutMode::Select,
+                    },
+                );
+                tokio::spawn(expire_session(
+                    bot.clone(),
+                    sessions.clone(),
+                    chat_id,
+                    generation,
+                    LAYOUT_TIMEOUT,
+                ));
+            }
         }
 
         Command::Cancel => {
@@ -760,6 +944,30 @@ async fn command_handler(
                 chat_id,
                 generation,
                 CATEGORY_TIMEOUT,
+            ));
+        }
+
+        Command::Layouts => {
+            let layouts = store.lock().await.layouts(chat_id)?;
+            let sent = bot
+                .send_message(chat_id, layouts_text(&layouts, false))
+                .reply_markup(layouts_keyboard(&layouts, false))
+                .await?;
+            let generation = generation();
+            sessions.lock().await.insert(
+                chat_id.0,
+                Session::Layout {
+                    message_id: sent.id,
+                    generation,
+                    mode: LayoutMode::Main,
+                },
+            );
+            tokio::spawn(expire_session(
+                bot.clone(),
+                sessions.clone(),
+                chat_id,
+                generation,
+                LAYOUT_TIMEOUT,
             ));
         }
 
@@ -935,9 +1143,96 @@ async fn text_handler(
             show_categories(&bot, &store, &sessions, chat_id, message_id, generation).await?;
         }
 
+        Some(Session::Layout {
+            message_id,
+            generation,
+            mode: LayoutMode::CreateName,
+        }) => {
+            let name = text.trim();
+            if name.is_empty() {
+                bot.send_message(chat_id, "Layout names cannot be empty. Send a name:")
+                    .await?;
+                return Ok(());
+            }
+            let layout = {
+                let store = store.lock().await;
+                if store
+                    .layouts(chat_id)?
+                    .iter()
+                    .any(|layout| layout.name.eq_ignore_ascii_case(name))
+                {
+                    None
+                } else {
+                    Some(store.create_layout(chat_id, name)?)
+                }
+            };
+            let Some(layout) = layout else {
+                bot.send_message(chat_id, "That layout already exists. Send another name:")
+                    .await?;
+                return Ok(());
+            };
+            set_layout_view(
+                &bot,
+                &sessions,
+                chat_id,
+                message_id,
+                generation,
+                LayoutMode::Arrange {
+                    name: layout.name.clone(),
+                    categories: layout.categories.clone(),
+                    moving: None,
+                    return_to: LayoutReturn::Main,
+                },
+                layout_arrange_text(&layout.name, &layout.categories, None),
+                layout_arrange_keyboard(&layout.categories, None),
+            )
+            .await?;
+        }
+
+        Some(Session::Layout {
+            message_id,
+            generation,
+            mode: LayoutMode::Rename { name, return_to },
+        }) => {
+            let new_name = text.trim();
+            if new_name.is_empty() {
+                bot.send_message(chat_id, "Layout names cannot be empty. Send a name:")
+                    .await?;
+                return Ok(());
+            }
+            let duplicate =
+                {
+                    let store = store.lock().await;
+                    if store.layouts(chat_id)?.iter().any(|layout| {
+                        layout.name != name && layout.name.eq_ignore_ascii_case(new_name)
+                    }) {
+                        true
+                    } else {
+                        store.rename_layout(chat_id, &name, new_name)?;
+                        false
+                    }
+                };
+            if duplicate {
+                bot.send_message(chat_id, "That layout already exists. Send another name:")
+                    .await?;
+                return Ok(());
+            }
+            show_layout_manage(
+                &bot, &store, &sessions, chat_id, message_id, generation, new_name, return_to,
+            )
+            .await?;
+        }
+
         Some(Session::Category { .. }) => {
             warn!(
                 "ignoring text message while category editor is active: {}",
+                text
+            );
+        }
+
+        Some(Session::Layout { .. }) => {
+            warn!(
+                "ignoring text message while layout editor is active: {}",
                 text
             );
         }
@@ -1037,6 +1332,551 @@ async fn show_category_editor(
         category_editor_keyboard(&category),
     )
     .await
+}
+
+async fn set_layout_view(
+    bot: &Bot,
+    sessions: &SharedSessions,
+    chat_id: ChatId,
+    message_id: MessageId,
+    generation: u64,
+    mode: LayoutMode,
+    text: String,
+    keyboard: InlineKeyboardMarkup,
+) -> Result<()> {
+    bot.edit_message_text(chat_id, message_id, text)
+        .reply_markup(keyboard)
+        .await?;
+    sessions.lock().await.insert(
+        chat_id.0,
+        Session::Layout {
+            message_id,
+            generation,
+            mode,
+        },
+    );
+    tokio::spawn(expire_session(
+        bot.clone(),
+        sessions.clone(),
+        chat_id,
+        generation,
+        LAYOUT_TIMEOUT,
+    ));
+    Ok(())
+}
+
+async fn show_layout_list(
+    bot: &Bot,
+    store: &SharedStore,
+    sessions: &SharedSessions,
+    chat_id: ChatId,
+    message_id: MessageId,
+    generation: u64,
+    selecting: bool,
+) -> Result<()> {
+    let layouts = store.lock().await.layouts(chat_id)?;
+    set_layout_view(
+        bot,
+        sessions,
+        chat_id,
+        message_id,
+        generation,
+        if selecting {
+            LayoutMode::Select
+        } else {
+            LayoutMode::Main
+        },
+        layouts_text(&layouts, selecting),
+        layouts_keyboard(&layouts, selecting),
+    )
+    .await
+}
+
+async fn show_layout_manage(
+    bot: &Bot,
+    store: &SharedStore,
+    sessions: &SharedSessions,
+    chat_id: ChatId,
+    message_id: MessageId,
+    generation: u64,
+    name: &str,
+    return_to: LayoutReturn,
+) -> Result<()> {
+    let layout = store
+        .lock()
+        .await
+        .layouts(chat_id)?
+        .into_iter()
+        .find(|layout| layout.name == name)
+        .with_context(|| format!("layout {name:?} does not exist"))?;
+    set_layout_view(
+        bot,
+        sessions,
+        chat_id,
+        message_id,
+        generation,
+        LayoutMode::Manage {
+            name: layout.name.clone(),
+            return_to,
+        },
+        format!("Edit layout: {}", layout.name),
+        layout_management_keyboard(),
+    )
+    .await
+}
+
+async fn layout_callback(
+    bot: Bot,
+    query_id: teloxide::types::CallbackQueryId,
+    data: &str,
+    chat_id: ChatId,
+    clicked_message_id: MessageId,
+    store: SharedStore,
+    sessions: SharedSessions,
+) -> Result<()> {
+    let session = sessions.lock().await.get(&chat_id.0).cloned();
+    let Some(Session::Layout {
+        message_id,
+        generation,
+        mode,
+    }) = session
+    else {
+        bot.answer_callback_query(query_id)
+            .text("This operation has expired")
+            .await?;
+        return Ok(());
+    };
+    if clicked_message_id != message_id {
+        bot.answer_callback_query(query_id)
+            .text("This operation has expired")
+            .await?;
+        return Ok(());
+    }
+    let Some(action) = data.strip_prefix("layout:") else {
+        bot.answer_callback_query(query_id).await?;
+        return Ok(());
+    };
+
+    match action {
+        "back" => {
+            bot.answer_callback_query(query_id).await?;
+            match mode {
+                LayoutMode::Main => {
+                    bot.edit_message_reply_markup(chat_id, message_id)
+                        .reply_markup(InlineKeyboardMarkup::default())
+                        .await?;
+                    sessions.lock().await.remove(&chat_id.0);
+                }
+                LayoutMode::Select => {
+                    if store.lock().await.layouts(chat_id)?.is_empty() {
+                        store.lock().await.sort_items_by_category(chat_id).await?;
+                        bot.edit_message_text(
+                            chat_id,
+                            message_id,
+                            "Sorted items by category priority",
+                        )
+                        .reply_markup(InlineKeyboardMarkup::default())
+                        .await?;
+                    } else {
+                        bot.edit_message_reply_markup(chat_id, message_id)
+                            .reply_markup(InlineKeyboardMarkup::default())
+                            .await?;
+                    }
+                    sessions.lock().await.remove(&chat_id.0);
+                }
+                LayoutMode::Manage { return_to, .. } => {
+                    show_layout_list(
+                        &bot,
+                        &store,
+                        &sessions,
+                        chat_id,
+                        message_id,
+                        generation,
+                        matches!(return_to, LayoutReturn::Select),
+                    )
+                    .await?;
+                }
+                LayoutMode::Rename { name, return_to } => {
+                    show_layout_manage(
+                        &bot, &store, &sessions, chat_id, message_id, generation, &name, return_to,
+                    )
+                    .await?;
+                }
+                LayoutMode::Arrange {
+                    name,
+                    categories,
+                    moving: Some(_),
+                    return_to,
+                } => {
+                    set_layout_view(
+                        &bot,
+                        &sessions,
+                        chat_id,
+                        message_id,
+                        generation,
+                        LayoutMode::Arrange {
+                            name: name.clone(),
+                            categories: categories.clone(),
+                            moving: None,
+                            return_to,
+                        },
+                        layout_arrange_text(&name, &categories, None),
+                        layout_arrange_keyboard(&categories, None),
+                    )
+                    .await?;
+                }
+                LayoutMode::Arrange {
+                    name, return_to, ..
+                }
+                | LayoutMode::ConfirmDelete { name, return_to } => {
+                    show_layout_manage(
+                        &bot, &store, &sessions, chat_id, message_id, generation, &name, return_to,
+                    )
+                    .await?;
+                }
+                LayoutMode::CreateName => {
+                    show_layout_list(
+                        &bot, &store, &sessions, chat_id, message_id, generation, false,
+                    )
+                    .await?;
+                }
+            }
+        }
+        "create" if matches!(mode, LayoutMode::Main) => {
+            bot.answer_callback_query(query_id).await?;
+            set_layout_view(
+                &bot,
+                &sessions,
+                chat_id,
+                message_id,
+                generation,
+                LayoutMode::CreateName,
+                "Send a name for the new layout:".to_string(),
+                InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
+                    "Cancel",
+                    "layout:back",
+                )]]),
+            )
+            .await?;
+        }
+        action if action.starts_with("edit:") || action.starts_with("edit-select:") => {
+            let return_to = if action.starts_with("edit-select:") {
+                LayoutReturn::Select
+            } else {
+                LayoutReturn::Main
+            };
+            if !matches!(mode, LayoutMode::Main | LayoutMode::Select) {
+                bot.answer_callback_query(query_id)
+                    .text("Choose a layout first")
+                    .await?;
+                return Ok(());
+            }
+            let index = action
+                .split_once(':')
+                .and_then(|(_, value)| value.parse::<usize>().ok());
+            let layouts = store.lock().await.layouts(chat_id)?;
+            let Some(layout) = index.and_then(|index| layouts.get(index)) else {
+                bot.answer_callback_query(query_id)
+                    .text("Layout no longer exists")
+                    .await?;
+                return Ok(());
+            };
+            let name = layout.name.clone();
+            bot.answer_callback_query(query_id).await?;
+            show_layout_manage(
+                &bot, &store, &sessions, chat_id, message_id, generation, &name, return_to,
+            )
+            .await?;
+        }
+        action if action.starts_with("select:") && matches!(mode, LayoutMode::Select) => {
+            let index = action
+                .strip_prefix("select:")
+                .and_then(|value| value.parse::<usize>().ok());
+            let layouts = store.lock().await.layouts(chat_id)?;
+            let Some(layout) = index.and_then(|index| layouts.get(index)) else {
+                bot.answer_callback_query(query_id)
+                    .text("Layout no longer exists")
+                    .await?;
+                return Ok(());
+            };
+            let name = layout.name.clone();
+            store
+                .lock()
+                .await
+                .sort_items_by_layout(chat_id, &name)
+                .await?;
+            bot.answer_callback_query(query_id)
+                .text(format!("Sorted by {name}"))
+                .await?;
+            bot.edit_message_text(
+                chat_id,
+                message_id,
+                format!("Sorted items by layout {name}"),
+            )
+            .reply_markup(InlineKeyboardMarkup::default())
+            .await?;
+            sessions.lock().await.remove(&chat_id.0);
+        }
+        "rename" => {
+            let LayoutMode::Manage { name, return_to } = mode else {
+                bot.answer_callback_query(query_id)
+                    .text("Choose a layout to rename first")
+                    .await?;
+                return Ok(());
+            };
+            bot.answer_callback_query(query_id).await?;
+            set_layout_view(
+                &bot,
+                &sessions,
+                chat_id,
+                message_id,
+                generation,
+                LayoutMode::Rename {
+                    name: name.clone(),
+                    return_to,
+                },
+                format!("Send a new name for {name}:"),
+                InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
+                    "Back",
+                    "layout:back",
+                )]]),
+            )
+            .await?;
+        }
+        "arrange" => {
+            let LayoutMode::Manage { name, return_to } = mode else {
+                bot.answer_callback_query(query_id)
+                    .text("Choose a layout to re-arrange first")
+                    .await?;
+                return Ok(());
+            };
+            let layout = store
+                .lock()
+                .await
+                .layouts(chat_id)?
+                .into_iter()
+                .find(|layout| layout.name == name)
+                .with_context(|| format!("layout {name:?} does not exist"))?;
+            bot.answer_callback_query(query_id).await?;
+            set_layout_view(
+                &bot,
+                &sessions,
+                chat_id,
+                message_id,
+                generation,
+                LayoutMode::Arrange {
+                    name: name.clone(),
+                    categories: layout.categories.clone(),
+                    moving: None,
+                    return_to,
+                },
+                layout_arrange_text(&name, &layout.categories, None),
+                layout_arrange_keyboard(&layout.categories, None),
+            )
+            .await?;
+        }
+        "delete" => {
+            let LayoutMode::Manage { name, return_to } = mode else {
+                bot.answer_callback_query(query_id)
+                    .text("Choose a layout to delete first")
+                    .await?;
+                return Ok(());
+            };
+            bot.answer_callback_query(query_id).await?;
+            set_layout_view(
+                &bot,
+                &sessions,
+                chat_id,
+                message_id,
+                generation,
+                LayoutMode::ConfirmDelete {
+                    name: name.clone(),
+                    return_to,
+                },
+                format!("Delete layout {name:?}?"),
+                layout_confirmation_keyboard(),
+            )
+            .await?;
+        }
+        "confirm-delete" => {
+            let LayoutMode::ConfirmDelete { name, return_to } = mode else {
+                bot.answer_callback_query(query_id)
+                    .text("Choose a layout to delete first")
+                    .await?;
+                return Ok(());
+            };
+            store.lock().await.delete_layout(chat_id, &name)?;
+            bot.answer_callback_query(query_id)
+                .text("Layout deleted")
+                .await?;
+            show_layout_list(
+                &bot,
+                &store,
+                &sessions,
+                chat_id,
+                message_id,
+                generation,
+                matches!(return_to, LayoutReturn::Select),
+            )
+            .await?;
+        }
+        "cancel-delete" => {
+            let LayoutMode::ConfirmDelete { name, return_to } = mode else {
+                bot.answer_callback_query(query_id).await?;
+                return Ok(());
+            };
+            bot.answer_callback_query(query_id).await?;
+            show_layout_manage(
+                &bot, &store, &sessions, chat_id, message_id, generation, &name, return_to,
+            )
+            .await?;
+        }
+        action if action.starts_with("move:") => {
+            let LayoutMode::Arrange {
+                name,
+                categories,
+                moving: None,
+                return_to,
+            } = mode
+            else {
+                bot.answer_callback_query(query_id)
+                    .text("Select a category to move first")
+                    .await?;
+                return Ok(());
+            };
+            let index = action
+                .strip_prefix("move:")
+                .and_then(|value| value.parse::<usize>().ok());
+            let Some(index) = index.filter(|index| *index < categories.len()) else {
+                bot.answer_callback_query(query_id)
+                    .text("Category no longer exists")
+                    .await?;
+                return Ok(());
+            };
+            bot.answer_callback_query(query_id)
+                .text("Select the category to place it after")
+                .await?;
+            set_layout_view(
+                &bot,
+                &sessions,
+                chat_id,
+                message_id,
+                generation,
+                LayoutMode::Arrange {
+                    name: name.clone(),
+                    categories: categories.clone(),
+                    moving: Some(index),
+                    return_to,
+                },
+                layout_arrange_text(&name, &categories, Some(index)),
+                layout_arrange_keyboard(&categories, Some(index)),
+            )
+            .await?;
+        }
+        action if action.starts_with("place:") => {
+            let LayoutMode::Arrange {
+                name,
+                mut categories,
+                moving: Some(moving),
+                return_to,
+            } = mode
+            else {
+                bot.answer_callback_query(query_id)
+                    .text("Select a category to move first")
+                    .await?;
+                return Ok(());
+            };
+            let target = action
+                .strip_prefix("place:")
+                .and_then(|value| value.parse::<usize>().ok());
+            let Some(target) = target.filter(|index| *index < categories.len() && *index != moving)
+            else {
+                bot.answer_callback_query(query_id)
+                    .text("Target category no longer exists")
+                    .await?;
+                return Ok(());
+            };
+            let target_name = categories[target].clone();
+            let moved = categories.remove(moving);
+            let target = categories
+                .iter()
+                .position(|category| category == &target_name)
+                .context("target category disappeared while rearranging")?;
+            categories.insert(target + 1, moved);
+            store
+                .lock()
+                .await
+                .save_layout(chat_id, &name, &categories)?;
+            bot.answer_callback_query(query_id).await?;
+            set_layout_view(
+                &bot,
+                &sessions,
+                chat_id,
+                message_id,
+                generation,
+                LayoutMode::Arrange {
+                    name: name.clone(),
+                    categories: categories.clone(),
+                    moving: None,
+                    return_to,
+                },
+                layout_arrange_text(&name, &categories, None),
+                layout_arrange_keyboard(&categories, None),
+            )
+            .await?;
+        }
+        "arrange-back" => {
+            let LayoutMode::Arrange {
+                name,
+                categories,
+                moving: Some(_),
+                return_to,
+            } = mode
+            else {
+                bot.answer_callback_query(query_id).await?;
+                return Ok(());
+            };
+            bot.answer_callback_query(query_id).await?;
+            set_layout_view(
+                &bot,
+                &sessions,
+                chat_id,
+                message_id,
+                generation,
+                LayoutMode::Arrange {
+                    name: name.clone(),
+                    categories: categories.clone(),
+                    moving: None,
+                    return_to,
+                },
+                layout_arrange_text(&name, &categories, None),
+                layout_arrange_keyboard(&categories, None),
+            )
+            .await?;
+        }
+        "done" => {
+            let LayoutMode::Arrange {
+                name, return_to, ..
+            } = mode
+            else {
+                bot.answer_callback_query(query_id)
+                    .text("No layout is being arranged")
+                    .await?;
+                return Ok(());
+            };
+            bot.answer_callback_query(query_id).await?;
+            show_layout_manage(
+                &bot, &store, &sessions, chat_id, message_id, generation, &name, return_to,
+            )
+            .await?;
+        }
+        _ => {
+            bot.answer_callback_query(query_id)
+                .text("Invalid layout action")
+                .await?;
+        }
+    }
+    Ok(())
 }
 
 async fn category_callback(
@@ -1427,6 +2267,10 @@ async fn callback_handler(
     if data.starts_with("category:") {
         return category_callback(bot, query.id, data, chat_id, message.id(), store, sessions)
             .await;
+    }
+
+    if data.starts_with("layout:") {
+        return layout_callback(bot, query.id, data, chat_id, message.id(), store, sessions).await;
     }
 
     if let Some(action) = data.strip_prefix("revive:") {
@@ -1961,6 +2805,12 @@ async fn callback_handler(
         Some(Session::Category { .. }) => {
             bot.answer_callback_query(query.id)
                 .text("Please use the category editor buttons")
+                .await?;
+        }
+
+        Some(Session::Layout { .. }) => {
+            bot.answer_callback_query(query.id)
+                .text("Please use the layout editor buttons")
                 .await?;
         }
 
