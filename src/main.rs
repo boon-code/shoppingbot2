@@ -163,8 +163,14 @@ enum AdvancedMode {
     Select,
     ImportMerge,
     ImportReplace,
+    ImportHistory,
     ExportPlain,
     ConfirmReplace(CategoryBundle),
+}
+
+#[derive(serde::Deserialize)]
+struct HistoryCategoriesDocument {
+    categories: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Clone, Debug)]
@@ -392,6 +398,10 @@ fn advanced_keyboard() -> InlineKeyboardMarkup {
         vec![InlineKeyboardButton::callback(
             "Import / Update categories",
             "advanced:merge",
+        )],
+        vec![InlineKeyboardButton::callback(
+            "Import categories (JSON)",
+            "advanced:history",
         )],
         vec![InlineKeyboardButton::callback(
             "Export categories",
@@ -657,6 +667,23 @@ fn parse_import_list(text: &str) -> Vec<String> {
         .filter(|line| !line.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+fn parse_history_categories(
+    data: &[u8],
+) -> Result<std::collections::BTreeMap<String, Vec<String>>> {
+    let document: HistoryCategoriesDocument = serde_json::from_slice(data)?;
+    for (category, category_items) in &document.categories {
+        if category.trim().is_empty() {
+            anyhow::bail!("category names cannot be empty");
+        }
+        for item in category_items {
+            if item.trim().is_empty() {
+                anyhow::bail!("category {category:?} contains an empty item");
+            }
+        }
+    }
+    Ok(document.categories)
 }
 
 async fn get_chat_id(message: &Message) -> Option<ChatId> {
@@ -1055,7 +1082,7 @@ async fn text_handler(
         };
         if !matches!(
             mode,
-            AdvancedMode::ImportMerge | AdvancedMode::ImportReplace
+            AdvancedMode::ImportMerge | AdvancedMode::ImportReplace | AdvancedMode::ImportHistory
         ) {
             bot.send_message(chat_id, "Choose an import option in /advanced first.")
                 .await?;
@@ -1065,6 +1092,40 @@ async fn text_handler(
         let file = bot.get_file(document.file.id.clone()).await?;
         let mut contents = Vec::new();
         bot.download_file(&file.path, &mut contents).await?;
+        if matches!(mode, AdvancedMode::ImportHistory) {
+            let categories = match parse_history_categories(&contents) {
+                Ok(categories) => categories,
+                Err(error) => {
+                    bot.send_message(chat_id, format!("Invalid categories JSON: {error:#}"))
+                        .await?;
+                    return Ok(());
+                }
+            };
+            let (count, conflicts) = store
+                .lock()
+                .await
+                .import_history_categories(chat_id, &categories)
+                .await?;
+            bot.edit_message_text(
+                chat_id,
+                message_id,
+                format!(
+                    "Imported {count} item(s) into history. The shopping list was not changed.{}",
+                    if conflicts == 0 {
+                        String::new()
+                    } else {
+                        format!(
+                            "\nWarning: {conflicts} item conflict(s) were skipped because each item can belong to only one category."
+                        )
+                    }
+                ),
+            )
+            .reply_markup(InlineKeyboardMarkup::default())
+            .await?;
+            sessions.lock().await.remove(&chat_id.0);
+            return Ok(());
+        }
+
         let bundle: CategoryBundle = match serde_json::from_slice(&contents) {
             Ok(bundle) => bundle,
             Err(error) => {
@@ -1628,6 +1689,23 @@ async fn advanced_callback(
                 generation,
                 AdvancedMode::ImportMerge,
                 "Upload the exported categories JSON file as a document to import / update:",
+                InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
+                    "Back",
+                    "advanced:back",
+                )]]),
+            )
+            .await?;
+        }
+        "history" if matches!(mode, AdvancedMode::Select) => {
+            bot.answer_callback_query(query_id).await?;
+            set_advanced_view(
+                &bot,
+                &sessions,
+                chat_id,
+                message_id,
+                generation,
+                AdvancedMode::ImportHistory,
+                "Upload a JSON document containing a top-level categories map (category names to lists of item names). Items will be added to history only:",
                 InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
                     "Back",
                     "advanced:back",
@@ -3249,7 +3327,7 @@ async fn main() -> Result<()> {
 mod tests {
     use crate::rstrip_slash;
 
-    use super::{Item, parse_import_list, plain_list_text};
+    use super::{Item, parse_history_categories, parse_import_list, plain_list_text};
 
     #[test]
     fn plain_list_export_has_no_header_and_can_exclude_checked_items() {
@@ -3277,6 +3355,35 @@ mod tests {
             parse_import_list("  milk \r\n\n eggs\n  bread  \n"),
             vec!["milk", "eggs", "bread"]
         );
+    }
+
+    #[test]
+    fn parses_category_item_map_for_history_import() {
+        assert_eq!(
+            parse_history_categories(
+                br#"{"categories":{"Produce":["apples","carrots"],"Bakery":["bread"]}}"#
+            )
+            .unwrap(),
+            std::collections::BTreeMap::from([
+                ("Bakery".to_string(), vec!["bread".to_string()]),
+                (
+                    "Produce".to_string(),
+                    vec!["apples".to_string(), "carrots".to_string()],
+                ),
+            ])
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_history_category_documents() {
+        for data in [
+            br#"{"categories":{"Produce":"apples"}}"#.as_slice(),
+            br#"{"categories":{"   ":["apples"]}}"#.as_slice(),
+            br#"{"categories":{"Produce":[" "]}}"#.as_slice(),
+            br#"{"items":["apples"]}"#.as_slice(),
+        ] {
+            assert!(parse_history_categories(data).is_err());
+        }
     }
 
     #[test]

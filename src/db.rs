@@ -2,7 +2,7 @@ use super::ChatId;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
@@ -899,6 +899,89 @@ impl Store {
         let items = Arc::clone(&entry.items);
         self.queue_save(chat_key.clone(), items)?;
         self.track_history(&chat_key, &texts).await
+    }
+
+    pub async fn add_history_items(&mut self, chat_id: ChatId, texts: Vec<String>) -> Result<()> {
+        if texts.is_empty() {
+            return Ok(());
+        }
+        self.track_history(&chat_id.0.to_string(), &texts).await
+    }
+
+    pub async fn import_history_categories(
+        &mut self,
+        chat_id: ChatId,
+        categories: &BTreeMap<String, Vec<String>>,
+    ) -> Result<(usize, usize)> {
+        let items = categories
+            .values()
+            .flat_map(|items| items.iter().cloned())
+            .collect::<Vec<_>>();
+        let count = items.len();
+        self.add_history_items(chat_id, items).await?;
+
+        let mut category_names = HashMap::new();
+        for category in categories.keys() {
+            let category_name = match self
+                .categories(chat_id)?
+                .into_iter()
+                .find(|existing| existing.name.eq_ignore_ascii_case(category.trim()))
+            {
+                Some(existing) => existing.name,
+                None => self.create_category(chat_id, category)?.name,
+            };
+            category_names.insert(category.to_lowercase(), category_name);
+        }
+
+        let existing_categories = self.categories(chat_id)?;
+        let mut existing_owners: HashMap<String, HashSet<String>> = HashMap::new();
+        for category in existing_categories {
+            for item in category.items {
+                existing_owners
+                    .entry(item_key(&item))
+                    .or_default()
+                    .insert(category.name.to_lowercase());
+            }
+        }
+
+        let mut requested_assignments: HashMap<String, (String, HashSet<String>)> = HashMap::new();
+        for (category, items) in categories {
+            let category_name = &category_names[&category.to_lowercase()];
+            for item in items {
+                requested_assignments
+                    .entry(item_key(item))
+                    .or_insert_with(|| (item.clone(), HashSet::new()))
+                    .1
+                    .insert(category_name.to_lowercase());
+            }
+        }
+
+        let mut conflicts = 0;
+        for (key, (item, requested_categories)) in requested_assignments {
+            let existing_categories = existing_owners.get(&key);
+            let is_conflict = requested_categories.len() > 1
+                || existing_categories.is_some_and(|owners| {
+                    owners
+                        .iter()
+                        .any(|owner| !requested_categories.contains(owner))
+                });
+            if is_conflict {
+                conflicts += 1;
+                continue;
+            }
+
+            let category_name = requested_categories
+                .iter()
+                .next()
+                .expect("each imported item has a category");
+            let category_name = category_names
+                .values()
+                .find(|name| name.eq_ignore_ascii_case(category_name))
+                .expect("requested category exists");
+            self.add_category_item(chat_id, category_name, &item)?;
+        }
+
+        Ok((count, conflicts))
     }
 
     async fn track_history(&mut self, chat_id: &str, texts: &[String]) -> Result<()> {
@@ -2302,6 +2385,118 @@ mod tests {
         assert_eq!(persisted[1].count, 2);
         assert_eq!(persisted[0].spelling[0]["Tomaten"].count, 3);
 
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn adds_history_items_without_changing_shopping_list() {
+        let directory = test_directory("history-only");
+        let chat_id = ChatId(1234);
+        let mut store = Store::load(&directory).await.unwrap();
+
+        store
+            .add_history_items(
+                chat_id,
+                vec!["Milk".to_string(), "Eggs".to_string(), "Milk".to_string()],
+            )
+            .await
+            .unwrap();
+
+        assert!(store.items(chat_id).await.unwrap().is_empty());
+        assert_eq!(
+            store.history_items(chat_id).await.unwrap(),
+            vec![("milk".to_string(), 2), ("eggs".to_string(), 1)]
+        );
+
+        store.shutdown().unwrap();
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn imports_categories_into_history_without_changing_the_list() {
+        let directory = test_directory("history-categories-import");
+        let chat_id = ChatId(1234);
+        let mut store = Store::load(&directory).await.unwrap();
+        store.create_category(chat_id, "Produce").unwrap();
+        store
+            .add_category_item(chat_id, "Produce", "Existing")
+            .unwrap();
+        store.create_category(chat_id, "Pantry").unwrap();
+        store
+            .add_category_item(chat_id, "Pantry", "Conflicted")
+            .unwrap();
+        store
+            .add_items(chat_id, vec!["Milk".to_string()])
+            .await
+            .unwrap();
+
+        let categories = BTreeMap::from([
+            (
+                "produce".to_string(),
+                vec!["Apples".to_string(), "Shared".to_string()],
+            ),
+            (
+                "Bakery".to_string(),
+                vec![
+                    "Bread".to_string(),
+                    "Shared".to_string(),
+                    "Conflicted".to_string(),
+                    "Cheese".to_string(),
+                ],
+            ),
+        ]);
+        assert_eq!(
+            store
+                .import_history_categories(chat_id, &categories)
+                .await
+                .unwrap(),
+            (6, 2)
+        );
+
+        let categories = store.categories(chat_id).unwrap();
+        assert_eq!(categories.len(), 3);
+        assert_eq!(
+            categories
+                .iter()
+                .find(|category| category.name == "Produce")
+                .unwrap()
+                .items,
+            vec!["Apples", "Existing"]
+        );
+        assert_eq!(
+            categories
+                .iter()
+                .find(|category| category.name == "Bakery")
+                .unwrap()
+                .items,
+            vec!["Bread", "Cheese"]
+        );
+        assert_eq!(
+            categories
+                .iter()
+                .find(|category| category.name == "Pantry")
+                .unwrap()
+                .items,
+            vec!["Conflicted"]
+        );
+        let history = store.history_items(chat_id).await.unwrap();
+        assert!(history.contains(&("shared".to_string(), 2)));
+        for item in ["apples", "bread", "cheese", "conflicted", "milk"] {
+            assert!(history.contains(&(item.to_string(), 1)));
+        }
+        assert_eq!(
+            store
+                .items(chat_id)
+                .await
+                .unwrap()
+                .iter()
+                .map(|item| item.item.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Milk"]
+        );
+        store.shutdown().unwrap();
+        drop(store);
         fs::remove_dir_all(directory).unwrap();
     }
 
