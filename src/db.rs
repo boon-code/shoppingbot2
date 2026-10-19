@@ -477,6 +477,7 @@ impl Store {
                 categories.len() - 1
             });
             let actual_name = categories[index].name.clone();
+            categories[index].priority = imported.priority;
             for item in &imported.items {
                 let key = item_key(item);
                 if categories[index]
@@ -1905,7 +1906,7 @@ mod tests {
             .find(|category| category.name == "Fruits")
             .unwrap();
         assert_eq!(fruits.items, vec!["Apple", "Banana"]);
-        assert_eq!(fruits.priority, 9);
+        assert_eq!(fruits.priority, -5);
         assert_eq!(
             categories
                 .iter()
