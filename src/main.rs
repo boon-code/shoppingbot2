@@ -652,12 +652,20 @@ async fn callback_handler(
 
         let (up, item_id) = match action {
             "done" => {
+                let items = {
+                    let mut store = store.lock().await;
+                    store.items(chat_id).await?
+                };
                 bot.answer_callback_query(query.id)
                     .text("Reordering finished")
                     .await?;
-                bot.edit_message_reply_markup(chat_id, message_id)
-                    .reply_markup(InlineKeyboardMarkup::default())
-                    .await?;
+                bot.edit_message_text(
+                    chat_id,
+                    message_id,
+                    format!("Reordered shopping list:\n\n{}", checklist_text(&items)),
+                )
+                .reply_markup(InlineKeyboardMarkup::default())
+                .await?;
                 sessions.lock().await.remove(&chat_id.0);
                 return Ok(());
             }
