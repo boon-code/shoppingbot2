@@ -46,10 +46,16 @@ pub struct Category {
     pub priority: i32,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Layout {
     pub name: String,
     pub categories: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CategoryBundle {
+    pub categories: Vec<Category>,
+    pub layouts: Vec<Layout>,
 }
 
 struct CacheEntry {
@@ -393,6 +399,176 @@ impl Store {
             }
         }
         Ok(layouts)
+    }
+
+    pub fn export_categories(&self, chat_id: ChatId) -> Result<CategoryBundle> {
+        let bundle = CategoryBundle {
+            categories: self.categories(chat_id)?,
+            layouts: self.layouts(chat_id)?,
+        };
+        validate_category_bundle(&bundle)?;
+        Ok(bundle)
+    }
+
+    pub fn import_categories(
+        &self,
+        chat_id: ChatId,
+        bundle: &CategoryBundle,
+        replace: bool,
+    ) -> Result<Vec<String>> {
+        validate_category_bundle(bundle)?;
+        let directory = self
+            .path
+            .join(categories_directory_name(&chat_id.0.to_string()));
+        fs::create_dir_all(&directory)
+            .with_context(|| format!("failed to create {}", directory.display()))?;
+
+        if replace {
+            let mut updates = Vec::new();
+            if directory.exists() {
+                for entry in fs::read_dir(&directory)
+                    .with_context(|| format!("failed to read {}", directory.display()))?
+                {
+                    let path = entry
+                        .with_context(|| format!("failed to read {}", directory.display()))?
+                        .path();
+                    if is_category_or_layout_file(&path) {
+                        updates.push((path, None));
+                    }
+                }
+            }
+            for category in &bundle.categories {
+                updates.push((
+                    directory.join(category_file_name(&category.name)),
+                    Some(
+                        serde_json::to_vec_pretty(category)
+                            .context("failed to serialize shopping category")?,
+                    ),
+                ));
+            }
+            for layout in &bundle.layouts {
+                updates.push((
+                    directory.join(layout_file_name(&layout.name)),
+                    Some(
+                        serde_json::to_vec_pretty(&layout.categories)
+                            .context("failed to serialize shop layout")?,
+                    ),
+                ));
+            }
+            replace_files_atomically(&directory, updates)?;
+            return Ok(Vec::new());
+        }
+
+        let existing_categories = self.categories(chat_id)?;
+        let mut categories = existing_categories.clone();
+        let mut imported_names = HashMap::new();
+        let mut messages = Vec::new();
+
+        for imported in &bundle.categories {
+            let existing_index = categories
+                .iter()
+                .position(|category| category.name.eq_ignore_ascii_case(&imported.name));
+            let index = existing_index.unwrap_or_else(|| {
+                categories.push(Category {
+                    name: imported.name.clone(),
+                    items: Vec::new(),
+                    priority: imported.priority,
+                });
+                categories.len() - 1
+            });
+            let actual_name = categories[index].name.clone();
+            for item in &imported.items {
+                let key = item_key(item);
+                if categories[index]
+                    .items
+                    .iter()
+                    .any(|existing| item_key(existing) == key)
+                {
+                    continue;
+                }
+                if let Some(owner) = categories.iter().find(|category| {
+                    category.name != actual_name
+                        && category
+                            .items
+                            .iter()
+                            .any(|existing| item_key(existing) == key)
+                }) {
+                    messages.push(format!(
+                        "Item {item:?} wasn't added because it is already in category {:?}.",
+                        owner.name
+                    ));
+                } else {
+                    categories[index].items.push(item.clone());
+                }
+            }
+            categories[index].items.sort();
+            imported_names.insert(imported.name.to_lowercase(), actual_name);
+        }
+
+        let existing_layouts = self.layouts(chat_id)?;
+        let mut layouts = existing_layouts.clone();
+        for imported in &bundle.layouts {
+            let incoming_categories = imported
+                .categories
+                .iter()
+                .map(|name| {
+                    imported_names
+                        .get(&name.to_lowercase())
+                        .cloned()
+                        .or_else(|| {
+                            categories
+                                .iter()
+                                .find(|category| category.name.eq_ignore_ascii_case(name))
+                                .map(|category| category.name.clone())
+                        })
+                        .unwrap_or_else(|| name.clone())
+                })
+                .collect::<Vec<_>>();
+            if let Some(existing) = layouts
+                .iter_mut()
+                .find(|layout| layout.name.eq_ignore_ascii_case(&imported.name))
+            {
+                for name in incoming_categories {
+                    if !existing.categories.contains(&name) {
+                        existing.categories.push(name);
+                    }
+                }
+            } else {
+                layouts.push(Layout {
+                    name: imported.name.clone(),
+                    categories: incoming_categories,
+                });
+            }
+        }
+
+        let mut updates = categories
+            .iter()
+            .map(|category| {
+                Ok((
+                    directory.join(category_file_name(&category.name)),
+                    Some(
+                        serde_json::to_vec_pretty(category)
+                            .context("failed to serialize shopping category")?,
+                    ),
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        updates.extend(
+            layouts
+                .iter()
+                .map(|layout| {
+                    Ok((
+                        directory.join(layout_file_name(&layout.name)),
+                        Some(
+                            serde_json::to_vec_pretty(&layout.categories)
+                                .context("failed to serialize shop layout")?,
+                        ),
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?,
+        );
+        replace_files_atomically(&directory, updates)?;
+        Ok(messages)
     }
 
     pub fn create_layout(&self, chat_id: ChatId, name: &str) -> Result<Layout> {
@@ -1009,6 +1185,98 @@ fn normalize_layout_categories(stored: &[String], categories: &[String]) -> Vec<
     normalized
 }
 
+fn item_key(item: &str) -> String {
+    item.trim().to_lowercase()
+}
+
+fn is_category_or_layout_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            (name.starts_with("category_") || name.starts_with("layout_"))
+                && name.ends_with(".json")
+        })
+}
+
+pub fn validate_category_bundle(bundle: &CategoryBundle) -> Result<()> {
+    let mut categories = HashMap::new();
+    let mut assigned_items = HashMap::new();
+
+    for category in &bundle.categories {
+        let name = category.name.trim();
+        if name.is_empty() {
+            bail!("category name cannot be empty");
+        }
+        let key = name.to_lowercase();
+        if categories.insert(key, category.name.as_str()).is_some() {
+            bail!("duplicate category name {:?}", category.name);
+        }
+
+        let mut category_items = HashSet::new();
+        for item in &category.items {
+            let item_name = item.trim();
+            if item_name.is_empty() {
+                bail!("category {:?} contains an empty item", category.name);
+            }
+            let item_key = item_key(item_name);
+            if !category_items.insert(item_key.clone()) {
+                bail!(
+                    "category {:?} contains duplicate item {:?}",
+                    category.name,
+                    item
+                );
+            }
+            if let Some(owner) = assigned_items.insert(item_key, category.name.as_str()) {
+                bail!(
+                    "item {:?} is assigned to both {:?} and {:?}",
+                    item,
+                    owner,
+                    category.name
+                );
+            }
+        }
+    }
+
+    let mut layout_names = HashSet::new();
+    for layout in &bundle.layouts {
+        let name = layout.name.trim();
+        if name.is_empty() {
+            bail!("layout name cannot be empty");
+        }
+        if !layout_names.insert(name.to_lowercase()) {
+            bail!("duplicate layout name {:?}", layout.name);
+        }
+        let mut layout_categories = HashSet::new();
+        for category in &layout.categories {
+            let key = category.to_lowercase();
+            if !categories.contains_key(&key) {
+                bail!(
+                    "layout {:?} references unknown category {:?}",
+                    layout.name,
+                    category
+                );
+            }
+            if !layout_categories.insert(key) {
+                bail!(
+                    "layout {:?} contains duplicate category {:?}",
+                    layout.name,
+                    category
+                );
+            }
+        }
+        for category in &bundle.categories {
+            if !layout_categories.contains(&category.name.trim().to_lowercase()) {
+                bail!(
+                    "layout {:?} is missing category {:?}",
+                    layout.name,
+                    category.name
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn replace_files_atomically(
     directory: &Path,
     updates: Vec<(PathBuf, Option<Vec<u8>>)>,
@@ -1579,6 +1847,138 @@ mod tests {
             .unwrap();
         assert_eq!(category.priority, 7);
         drop(reopened);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn merges_category_imports_without_overwriting_or_reassigning_items() {
+        let directory = test_directory("merge-category-import");
+        let store = Store::load(&directory).await.unwrap();
+        let chat_id = ChatId(1234);
+        store.create_category(chat_id, "Fruits").unwrap();
+        store.add_category_item(chat_id, "Fruits", "Apple").unwrap();
+        store.set_category_priority(chat_id, "Fruits", 9).unwrap();
+        store.create_category(chat_id, "Pantry").unwrap();
+        store.add_category_item(chat_id, "Pantry", "Beans").unwrap();
+        store.create_layout(chat_id, "Shop").unwrap();
+        store
+            .save_layout(
+                chat_id,
+                "Shop",
+                &["Fruits".to_string(), "Pantry".to_string()],
+            )
+            .unwrap();
+
+        let bundle = CategoryBundle {
+            categories: vec![
+                Category {
+                    name: "FRUITS".to_string(),
+                    items: vec![
+                        "apple".to_string(),
+                        "Banana".to_string(),
+                        "Beans".to_string(),
+                    ],
+                    priority: -5,
+                },
+                Category {
+                    name: "Snacks".to_string(),
+                    items: vec!["Toffee".to_string()],
+                    priority: 2,
+                },
+            ],
+            layouts: vec![
+                Layout {
+                    name: "Shop".to_string(),
+                    categories: vec!["Snacks".to_string(), "FRUITS".to_string()],
+                },
+                Layout {
+                    name: "Weekend".to_string(),
+                    categories: vec!["Snacks".to_string(), "FRUITS".to_string()],
+                },
+            ],
+        };
+        let conflicts = store.import_categories(chat_id, &bundle, false).unwrap();
+
+        let categories = store.categories(chat_id).unwrap();
+        let fruits = categories
+            .iter()
+            .find(|category| category.name == "Fruits")
+            .unwrap();
+        assert_eq!(fruits.items, vec!["Apple", "Banana"]);
+        assert_eq!(fruits.priority, 9);
+        assert_eq!(
+            categories
+                .iter()
+                .find(|category| category.name == "Snacks")
+                .unwrap()
+                .items,
+            vec!["Toffee"]
+        );
+        assert_eq!(conflicts.len(), 1);
+        assert!(conflicts[0].contains("already in category \"Pantry\""));
+
+        let layouts = store.layouts(chat_id).unwrap();
+        let shop = layouts.iter().find(|layout| layout.name == "Shop").unwrap();
+        assert_eq!(shop.categories, vec!["Fruits", "Pantry", "Snacks"]);
+        assert!(
+            layouts.iter().any(|layout| {
+                layout.name == "Weekend" && layout.categories == ["Snacks", "Fruits", "Pantry"]
+            }),
+            "{layouts:?}"
+        );
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn replaces_all_categories_and_layouts_after_validation() {
+        let directory = test_directory("replace-category-import");
+        let store = Store::load(&directory).await.unwrap();
+        let chat_id = ChatId(1234);
+        store.create_category(chat_id, "Old").unwrap();
+        store
+            .add_category_item(chat_id, "Old", "stale item")
+            .unwrap();
+        store.create_layout(chat_id, "Old layout").unwrap();
+
+        let invalid = CategoryBundle {
+            categories: vec![Category {
+                name: "Fresh".to_string(),
+                items: vec!["shared".to_string()],
+                priority: 0,
+            }],
+            layouts: vec![Layout {
+                name: "Bad layout".to_string(),
+                categories: vec!["Missing".to_string()],
+            }],
+        };
+        assert!(store.import_categories(chat_id, &invalid, true).is_err());
+        assert_eq!(store.categories(chat_id).unwrap()[0].name, "Old");
+
+        let replacement = CategoryBundle {
+            categories: vec![Category {
+                name: "Fresh".to_string(),
+                items: vec!["new item".to_string()],
+                priority: 4,
+            }],
+            layouts: vec![Layout {
+                name: "Fresh layout".to_string(),
+                categories: vec!["Fresh".to_string()],
+            }],
+        };
+        store
+            .import_categories(chat_id, &replacement, true)
+            .unwrap();
+        assert_eq!(store.categories(chat_id).unwrap(), replacement.categories);
+        assert_eq!(store.layouts(chat_id).unwrap(), replacement.layouts);
+        let category_directory = directory.join(categories_directory_name("1234"));
+        assert!(!category_directory.join(category_file_name("Old")).exists());
+        assert!(
+            !category_directory
+                .join(layout_file_name("Old layout"))
+                .exists()
+        );
+        drop(store);
         fs::remove_dir_all(directory).unwrap();
     }
 

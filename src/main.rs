@@ -10,14 +10,15 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use db::{Category, Item, Layout, Store};
+use db::{Category, CategoryBundle, Item, Layout, Store};
 use log::{debug, info, warn};
 use teloxide::{
     dispatching::UpdateFilterExt,
+    net::Download,
     prelude::*,
     types::{
-        CallbackQuery, ChatId, InlineKeyboardButton, InlineKeyboardMarkup, Message, MessageId,
-        Update,
+        CallbackQuery, ChatId, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message,
+        MessageId, Update,
     },
     utils::command::BotCommands,
 };
@@ -32,6 +33,7 @@ const REORDER_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const REVIVE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const CATEGORY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const LAYOUT_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const ADVANCED_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 type SharedStore = Arc<Mutex<Store>>;
 type SharedSessions = Arc<Mutex<HashMap<i64, Session>>>;
@@ -94,6 +96,9 @@ enum Command {
     #[command(description = "Edit item categories")]
     Category,
 
+    #[command(description = "Import, export, or replace categories")]
+    Advanced,
+
     #[command(description = "Show help text")]
     Help,
 
@@ -145,6 +150,20 @@ enum Session {
         generation: u64,
         mode: LayoutMode,
     },
+
+    Advanced {
+        message_id: MessageId,
+        generation: u64,
+        mode: AdvancedMode,
+    },
+}
+
+#[derive(Clone, Debug)]
+enum AdvancedMode {
+    Select,
+    ImportMerge,
+    ImportReplace,
+    ConfirmReplace(CategoryBundle),
 }
 
 #[derive(Clone, Debug)]
@@ -192,7 +211,8 @@ impl Session {
             | Session::Reorder { generation, .. }
             | Session::Revive { generation, .. }
             | Session::Category { generation, .. }
-            | Session::Layout { generation, .. } => *generation,
+            | Session::Layout { generation, .. }
+            | Session::Advanced { generation, .. } => *generation,
         }
     }
 
@@ -203,7 +223,8 @@ impl Session {
             | Session::Reorder { message_id, .. }
             | Session::Revive { message_id, .. }
             | Session::Category { message_id, .. }
-            | Session::Layout { message_id, .. } => Some(*message_id),
+            | Session::Layout { message_id, .. }
+            | Session::Advanced { message_id, .. } => Some(*message_id),
             Session::Add { .. } | Session::Import { .. } => None,
         }
     }
@@ -348,6 +369,31 @@ fn layouts_keyboard(layouts: &[Layout]) -> InlineKeyboardMarkup {
     )]);
     rows.push(vec![InlineKeyboardButton::callback("Back", "layout:back")]);
     InlineKeyboardMarkup::new(rows)
+}
+
+fn advanced_keyboard() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![
+        vec![InlineKeyboardButton::callback(
+            "Import / Update categories",
+            "advanced:merge",
+        )],
+        vec![InlineKeyboardButton::callback(
+            "Export categories",
+            "advanced:export",
+        )],
+        vec![InlineKeyboardButton::callback(
+            "Import & Replace categories",
+            "advanced:replace",
+        )],
+        vec![InlineKeyboardButton::callback("Done", "advanced:done")],
+    ])
+}
+
+fn advanced_confirm_keyboard() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![vec![
+        InlineKeyboardButton::callback("Replace categories", "advanced:confirm-replace"),
+        InlineKeyboardButton::callback("Cancel", "advanced:cancel-replace"),
+    ]])
 }
 
 fn layout_management_keyboard() -> InlineKeyboardMarkup {
@@ -910,6 +956,29 @@ async fn command_handler(
             ));
         }
 
+        Command::Advanced => {
+            let sent = bot
+                .send_message(chat_id, "Advanced category tools:")
+                .reply_markup(advanced_keyboard())
+                .await?;
+            let generation = generation();
+            sessions.lock().await.insert(
+                chat_id.0,
+                Session::Advanced {
+                    message_id: sent.id,
+                    generation,
+                    mode: AdvancedMode::Select,
+                },
+            );
+            tokio::spawn(expire_session(
+                bot.clone(),
+                sessions.clone(),
+                chat_id,
+                generation,
+                ADVANCED_TIMEOUT,
+            ));
+        }
+
         Command::Help => {
             bot.send_message(chat_id, Command::descriptions().to_string())
                 .await?;
@@ -934,6 +1003,89 @@ async fn text_handler(
     sessions: SharedSessions,
 ) -> Result<()> {
     let chat_id = msg.chat.id;
+
+    if let Some(document) = msg.document() {
+        let Some(Session::Advanced {
+            message_id,
+            generation,
+            mode,
+        }) = sessions.lock().await.get(&chat_id.0).cloned()
+        else {
+            bot.send_message(chat_id, "Use /advanced before uploading a categories file.")
+                .await?;
+            return Ok(());
+        };
+        if !matches!(
+            mode,
+            AdvancedMode::ImportMerge | AdvancedMode::ImportReplace
+        ) {
+            bot.send_message(chat_id, "Choose an import option in /advanced first.")
+                .await?;
+            return Ok(());
+        }
+
+        let file = bot.get_file(document.file.id.clone()).await?;
+        let mut contents = Vec::new();
+        bot.download_file(&file.path, &mut contents).await?;
+        let bundle: CategoryBundle = match serde_json::from_slice(&contents) {
+            Ok(bundle) => bundle,
+            Err(error) => {
+                bot.send_message(chat_id, format!("Invalid categories JSON: {error}"))
+                    .await?;
+                return Ok(());
+            }
+        };
+        if let Err(error) = db::validate_category_bundle(&bundle) {
+            bot.send_message(chat_id, format!("Import rejected: {error}"))
+                .await?;
+            return Ok(());
+        }
+
+        match mode {
+            AdvancedMode::ImportMerge => {
+                let conflicts = store
+                    .lock()
+                    .await
+                    .import_categories(chat_id, &bundle, false)?;
+                bot.edit_message_text(
+                    chat_id,
+                    message_id,
+                    format!(
+                        "Import / update complete. {} category/categories and {} layout(s) processed; {} item(s) were not added due to category conflicts.",
+                        bundle.categories.len(),
+                        bundle.layouts.len(),
+                        conflicts.len()
+                    ),
+                )
+                .reply_markup(InlineKeyboardMarkup::default())
+                .await?;
+                sessions.lock().await.remove(&chat_id.0);
+                for conflict in conflicts {
+                    bot.send_message(chat_id, conflict).await?;
+                }
+            }
+            AdvancedMode::ImportReplace => {
+                set_advanced_view(
+                    &bot,
+                    &sessions,
+                    chat_id,
+                    message_id,
+                    generation,
+                    AdvancedMode::ConfirmReplace(bundle.clone()),
+                    format!(
+                        "The file is valid: {} categories and {} layouts. Confirm to delete the current categories and layouts and replace them with this data.",
+                        bundle.categories.len(),
+                        bundle.layouts.len()
+                    )
+                    .as_str(),
+                    advanced_confirm_keyboard(),
+                )
+                .await?;
+            }
+            _ => unreachable!(),
+        }
+        return Ok(());
+    }
 
     let Some(text) = msg.text() else {
         bot.send_message(chat_id, "Unsupported content type")
@@ -1175,6 +1327,14 @@ async fn text_handler(
             );
         }
 
+        Some(Session::Advanced { .. }) => {
+            bot.send_message(
+                chat_id,
+                "Please upload the categories JSON file as a document.",
+            )
+            .await?;
+        }
+
         Some(_) => {
             warn!(
                 "ignoring text message while callback-based dialog is active: {}",
@@ -1354,6 +1514,182 @@ async fn show_layout_manage(
         layout_management_keyboard(),
     )
     .await
+}
+
+async fn set_advanced_view(
+    bot: &Bot,
+    sessions: &SharedSessions,
+    chat_id: ChatId,
+    message_id: MessageId,
+    generation: u64,
+    mode: AdvancedMode,
+    text: &str,
+    keyboard: InlineKeyboardMarkup,
+) -> Result<()> {
+    bot.edit_message_text(chat_id, message_id, text)
+        .reply_markup(keyboard)
+        .await?;
+    sessions.lock().await.insert(
+        chat_id.0,
+        Session::Advanced {
+            message_id,
+            generation,
+            mode,
+        },
+    );
+    tokio::spawn(expire_session(
+        bot.clone(),
+        sessions.clone(),
+        chat_id,
+        generation,
+        ADVANCED_TIMEOUT,
+    ));
+    Ok(())
+}
+
+async fn advanced_callback(
+    bot: Bot,
+    query_id: teloxide::types::CallbackQueryId,
+    data: &str,
+    chat_id: ChatId,
+    clicked_message_id: MessageId,
+    store: SharedStore,
+    sessions: SharedSessions,
+) -> Result<()> {
+    let session = sessions.lock().await.get(&chat_id.0).cloned();
+    let Some(Session::Advanced {
+        message_id,
+        generation,
+        mode,
+    }) = session
+    else {
+        bot.answer_callback_query(query_id)
+            .text("This operation has expired")
+            .await?;
+        return Ok(());
+    };
+    if clicked_message_id != message_id {
+        bot.answer_callback_query(query_id)
+            .text("This operation has expired")
+            .await?;
+        return Ok(());
+    }
+    let Some(action) = data.strip_prefix("advanced:") else {
+        bot.answer_callback_query(query_id).await?;
+        return Ok(());
+    };
+
+    match action {
+        "merge" if matches!(mode, AdvancedMode::Select) => {
+            bot.answer_callback_query(query_id).await?;
+            set_advanced_view(
+                &bot,
+                &sessions,
+                chat_id,
+                message_id,
+                generation,
+                AdvancedMode::ImportMerge,
+                "Upload the exported categories JSON file as a document to import / update:",
+                InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
+                    "Back",
+                    "advanced:back",
+                )]]),
+            )
+            .await?;
+        }
+        "replace" if matches!(mode, AdvancedMode::Select) => {
+            bot.answer_callback_query(query_id).await?;
+            set_advanced_view(
+                &bot,
+                &sessions,
+                chat_id,
+                message_id,
+                generation,
+                AdvancedMode::ImportReplace,
+                "Upload the exported categories JSON file as a document. It will be validated before you confirm replacement:",
+                InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
+                    "Back",
+                    "advanced:back",
+                )]]),
+            )
+            .await?;
+        }
+        "export" if matches!(mode, AdvancedMode::Select) => {
+            let bundle = store.lock().await.export_categories(chat_id)?;
+            let data = serde_json::to_vec_pretty(&bundle)
+                .context("failed to serialize categories export")?;
+            bot.answer_callback_query(query_id).await?;
+            bot.send_document(
+                chat_id,
+                InputFile::memory(data).file_name("categories.json"),
+            )
+            .await?;
+            bot.edit_message_reply_markup(chat_id, message_id)
+                .reply_markup(InlineKeyboardMarkup::default())
+                .await?;
+            sessions.lock().await.remove(&chat_id.0);
+        }
+        "back" => {
+            bot.answer_callback_query(query_id).await?;
+            set_advanced_view(
+                &bot,
+                &sessions,
+                chat_id,
+                message_id,
+                generation,
+                AdvancedMode::Select,
+                "Advanced category tools:",
+                advanced_keyboard(),
+            )
+            .await?;
+        }
+        "confirm-replace" => {
+            let AdvancedMode::ConfirmReplace(bundle) = mode else {
+                bot.answer_callback_query(query_id)
+                    .text("Validate a JSON file before confirming")
+                    .await?;
+                return Ok(());
+            };
+            store
+                .lock()
+                .await
+                .import_categories(chat_id, &bundle, true)?;
+            bot.answer_callback_query(query_id)
+                .text("Categories and layouts replaced")
+                .await?;
+            bot.edit_message_text(chat_id, message_id, "Categories and layouts replaced.")
+                .reply_markup(InlineKeyboardMarkup::default())
+                .await?;
+            sessions.lock().await.remove(&chat_id.0);
+        }
+        "cancel-replace" if matches!(mode, AdvancedMode::ConfirmReplace(_)) => {
+            bot.answer_callback_query(query_id).await?;
+            set_advanced_view(
+                &bot,
+                &sessions,
+                chat_id,
+                message_id,
+                generation,
+                AdvancedMode::Select,
+                "Replacement cancelled. Advanced category tools:",
+                advanced_keyboard(),
+            )
+            .await?;
+        }
+        "done" if matches!(mode, AdvancedMode::Select) => {
+            bot.answer_callback_query(query_id).await?;
+            bot.edit_message_reply_markup(chat_id, message_id)
+                .reply_markup(InlineKeyboardMarkup::default())
+                .await?;
+            sessions.lock().await.remove(&chat_id.0);
+        }
+        _ => {
+            bot.answer_callback_query(query_id)
+                .text("This action is not available right now")
+                .await?;
+        }
+    }
+    Ok(())
 }
 
 async fn layout_callback(
@@ -2166,6 +2502,11 @@ async fn callback_handler(
         return layout_callback(bot, query.id, data, chat_id, message.id(), store, sessions).await;
     }
 
+    if data.starts_with("advanced:") {
+        return advanced_callback(bot, query.id, data, chat_id, message.id(), store, sessions)
+            .await;
+    }
+
     if let Some(action) = data.strip_prefix("revive:") {
         let session = sessions.lock().await.get(&chat_id.0).cloned();
         let Some(Session::Revive {
@@ -2707,6 +3048,12 @@ async fn callback_handler(
                 .await?;
         }
 
+        Some(Session::Advanced { .. }) => {
+            bot.answer_callback_query(query.id)
+                .text("Please use the advanced category menu")
+                .await?;
+        }
+
         None => {
             bot.answer_callback_query(query.id)
                 .text("This operation has expired")
@@ -2785,6 +3132,7 @@ async fn main() -> Result<()> {
     let sessions: SharedSessions = Arc::new(Mutex::new(HashMap::new()));
 
     let bot = Bot::new(token);
+    bot.set_my_commands(Command::bot_commands()).await?;
 
     info!("Bot initialized");
 
