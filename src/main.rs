@@ -163,6 +163,7 @@ enum AdvancedMode {
     Select,
     ImportMerge,
     ImportReplace,
+    ExportPlain,
     ConfirmReplace(CategoryBundle),
 }
 
@@ -247,6 +248,21 @@ fn checklist_text(items: &[Item]) -> String {
         .collect::<Vec<_>>();
 
     format!("Your shopping list:\n\n{}", lines.join("\n"))
+}
+
+fn plain_list_text(items: &[Item], include_checked: bool) -> String {
+    items
+        .iter()
+        .filter(|item| include_checked || !item.checked)
+        .map(|item| {
+            if item.checked {
+                format!("- [x] {}", item.item)
+            } else {
+                format!("- [ ] {}", item.item)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn keyboard(items: &[Item]) -> Option<InlineKeyboardMarkup> {
@@ -385,7 +401,29 @@ fn advanced_keyboard() -> InlineKeyboardMarkup {
             "Import & Replace categories",
             "advanced:replace",
         )],
+        vec![InlineKeyboardButton::callback(
+            "Export shopping list (JSON)",
+            "advanced:export-list-json",
+        )],
+        vec![InlineKeyboardButton::callback(
+            "Export shopping list (plain)",
+            "advanced:export-list-plain",
+        )],
         vec![InlineKeyboardButton::callback("Done", "advanced:done")],
+    ])
+}
+
+fn plain_export_keyboard() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![
+        vec![InlineKeyboardButton::callback(
+            "All items (including checked items)",
+            "advanced:plain-all",
+        )],
+        vec![InlineKeyboardButton::callback(
+            "Only unchecked items",
+            "advanced:plain-unchecked",
+        )],
+        vec![InlineKeyboardButton::callback("Back", "advanced:back")],
     ])
 }
 
@@ -1628,6 +1666,51 @@ async fn advanced_callback(
                 .reply_markup(InlineKeyboardMarkup::default())
                 .await?;
             sessions.lock().await.remove(&chat_id.0);
+        }
+        "export-list-json" if matches!(mode, AdvancedMode::Select) => {
+            let items = store.lock().await.items(chat_id).await?;
+            let data =
+                serde_json::to_vec_pretty(&*items).context("failed to serialize shopping list")?;
+            bot.answer_callback_query(query_id).await?;
+            bot.send_document(
+                chat_id,
+                InputFile::memory(data).file_name(db::list_export_file_name(chat_id)),
+            )
+            .await?;
+        }
+        "export-list-plain" if matches!(mode, AdvancedMode::Select) => {
+            bot.answer_callback_query(query_id).await?;
+            set_advanced_view(
+                &bot,
+                &sessions,
+                chat_id,
+                message_id,
+                generation,
+                AdvancedMode::ExportPlain,
+                "Choose which items to include in the plain text export:",
+                plain_export_keyboard(),
+            )
+            .await?;
+        }
+        "plain-all" | "plain-unchecked" if matches!(mode, AdvancedMode::ExportPlain) => {
+            let include_checked = action == "plain-all";
+            let items = store.lock().await.items(chat_id).await?;
+            let data = plain_list_text(&items, include_checked);
+            bot.answer_callback_query(query_id).await?;
+            if !data.is_empty() {
+                bot.send_message(chat_id, data).await?;
+            }
+            set_advanced_view(
+                &bot,
+                &sessions,
+                chat_id,
+                message_id,
+                generation,
+                AdvancedMode::Select,
+                "Advanced category tools:",
+                advanced_keyboard(),
+            )
+            .await?;
         }
         "back" => {
             bot.answer_callback_query(query_id).await?;
@@ -3166,7 +3249,27 @@ async fn main() -> Result<()> {
 mod tests {
     use crate::rstrip_slash;
 
-    use super::{Item, parse_import_list};
+    use super::{Item, parse_import_list, plain_list_text};
+
+    #[test]
+    fn plain_list_export_has_no_header_and_can_exclude_checked_items() {
+        let items = vec![
+            Item {
+                id: 1,
+                item: "milk".to_string(),
+                checked: false,
+            },
+            Item {
+                id: 2,
+                item: "eggs".to_string(),
+                checked: true,
+            },
+        ];
+
+        assert_eq!(plain_list_text(&items, true), "- [ ] milk\n- [x] eggs");
+        assert_eq!(plain_list_text(&items, false), "- [ ] milk");
+        assert_eq!(plain_list_text(&[], true), "");
+    }
 
     #[test]
     fn parses_newline_separated_items_and_ignores_blank_lines() {

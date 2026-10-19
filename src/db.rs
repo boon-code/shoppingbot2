@@ -1148,6 +1148,10 @@ fn list_file_name(chat_id: &str) -> String {
     format!("list_{}.json", hex_encode(chat_id))
 }
 
+pub fn list_export_file_name(chat_id: ChatId) -> String {
+    list_file_name(&chat_id.0.to_string())
+}
+
 fn history_file_name(chat_id: &str) -> String {
     format!("history_{}", hex_encode(chat_id))
 }
@@ -1821,6 +1825,7 @@ mod tests {
     fn chat_id_is_encoded_as_hex_of_its_string() {
         assert_eq!(list_file_name("1234"), "list_31323334.json");
         assert_eq!(list_file_name("-100"), "list_2d313030.json");
+        assert_eq!(list_export_file_name(ChatId(1234)), "list_31323334.json");
         assert_eq!(history_file_name("1234"), "history_31323334");
     }
 
