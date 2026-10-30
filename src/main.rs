@@ -23,6 +23,7 @@ use tokio::{fs, sync::Mutex, time::sleep};
 mod advanced;
 mod category;
 mod db;
+mod item_entry;
 mod layout;
 mod presentation;
 mod quick_add;
@@ -217,42 +218,11 @@ impl Session {
     }
 }
 
-fn strip_list_prefix(line: &str) -> &str {
-    let line = line.trim();
-
-    // Markdown checkbox: - [ ] , - [x], - [X]
-    if let Some(rest) = line.strip_prefix("- [") {
-        if let Some(close) = rest.find(']') {
-            return rest[close + 1..].trim_start();
-        }
-    }
-
-    // No-space checkbox: -[]
-    if let Some(rest) = line.strip_prefix("-[]") {
-        return rest.trim_start();
-    }
-
-    // Simple dash prefix: -
-    if let Some(rest) = line.strip_prefix('-') {
-        return rest.trim_start();
-    }
-
-    line
-}
-
 fn rstrip_slash<'a>(s: &'a String) -> &'a str {
     match s.find('/') {
         Some(idx) => &s[(idx + 1)..],
         None => &s,
     }
-}
-
-fn parse_import_list(text: &str) -> Vec<String> {
-    text.lines()
-        .map(strip_list_prefix)
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
-        .collect()
 }
 
 async fn get_chat_id(message: &Message) -> Option<ChatId> {
@@ -333,29 +303,7 @@ async fn command_handler(
         }
 
         Command::Multiadd => {
-            let generation = generation();
-
-            {
-                let mut sessions = sessions.lock().await;
-                sessions.insert(
-                    chat_id.0,
-                    Session::Add {
-                        count: 0,
-                        generation,
-                    },
-                );
-            }
-
-            bot.send_message(chat_id, "Please name items to put on the list:")
-                .await?;
-
-            tokio::spawn(expire_session(
-                bot.clone(),
-                sessions.clone(),
-                chat_id,
-                generation,
-                ADD_TIMEOUT,
-            ));
+            item_entry::start_multiadd(&bot, &sessions, chat_id).await?;
         }
 
         Command::Quickadd => {
@@ -363,23 +311,7 @@ async fn command_handler(
         }
 
         Command::Import => {
-            let generation = generation();
-
-            sessions
-                .lock()
-                .await
-                .insert(chat_id.0, Session::Import { generation });
-
-            bot.send_message(chat_id, "Send the items to import, one item per line:")
-                .await?;
-
-            tokio::spawn(expire_session(
-                bot.clone(),
-                sessions.clone(),
-                chat_id,
-                generation,
-                ADD_TIMEOUT,
-            ));
+            item_entry::start_import(&bot, &sessions, chat_id).await?;
         }
 
         Command::Shop => {
@@ -479,6 +411,9 @@ async fn text_handler(
     };
 
     let session = sessions.lock().await.get(&chat_id.0).cloned();
+    if item_entry::handle_text(&bot, &store, &sessions, chat_id, text, &session).await? {
+        return Ok(());
+    }
     if category::handle_text(&bot, &store, &sessions, chat_id, text, &session).await? {
         return Ok(());
     }
@@ -498,48 +433,6 @@ async fn text_handler(
                 &bot, &store, &sessions, chat_id, message_id, generation, offset, item, text,
             )
             .await?;
-        }
-
-        Some(Session::Add { count, generation }) => {
-            {
-                let mut store = store.lock().await;
-                store.add_item(chat_id, text.to_string()).await?;
-            }
-
-            {
-                let mut sessions = sessions.lock().await;
-
-                sessions.insert(
-                    chat_id.0,
-                    Session::Add {
-                        count: count + 1,
-                        generation,
-                    },
-                );
-            }
-
-            bot.send_message(chat_id, format!("Added item {text}"))
-                .await?;
-        }
-
-        Some(Session::Import { .. }) => {
-            let items = parse_import_list(text);
-
-            if items.is_empty() {
-                bot.send_message(chat_id, "No items found. Send one item per line:")
-                    .await?;
-                return Ok(());
-            }
-
-            let count = items.len();
-            {
-                let mut store = store.lock().await;
-                store.add_items(chat_id, items).await?;
-            }
-            sessions.lock().await.remove(&chat_id.0);
-
-            bot.send_message(chat_id, format!("Imported {count} items"))
-                .await?;
         }
 
         Some(Session::Advanced { .. }) => {
@@ -705,10 +598,9 @@ async fn main() -> Result<()> {
 mod tests {
     use crate::rstrip_slash;
 
-    use super::parse_import_list;
-
     use crate::advanced::parse_history_categories;
     use crate::db::Item;
+    use crate::item_entry::parse_import_list;
     use crate::presentation::{
         layouts_keyboard, plain_list_text, reorder_keyboard, reorder_target_keyboard,
         revive_keyboard,
