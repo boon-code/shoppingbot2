@@ -25,6 +25,7 @@ use tokio::{fs, sync::Mutex, time::sleep};
 
 mod advanced;
 mod db;
+mod quick_add;
 
 const QUICK_ADD_PAGE_SIZE: usize = 30;
 const ADD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -124,7 +125,7 @@ enum Session {
         offset: usize,
         candidates: Vec<String>,
         has_more: bool,
-        mode: QuickAddMode,
+        mode: quick_add::QuickAddMode,
     },
 
     Import {
@@ -170,12 +171,6 @@ enum Session {
         generation: u64,
         mode: AdvancedMode,
     },
-}
-
-#[derive(Clone, Debug)]
-enum QuickAddMode {
-    Select,
-    Prefix { item: String },
 }
 
 #[derive(Clone, Debug)]
@@ -324,40 +319,6 @@ fn revive_keyboard(items: &[Item]) -> Option<InlineKeyboardMarkup> {
     }
     rows.push(vec![InlineKeyboardButton::callback("DONE", "revive:done")]);
     Some(InlineKeyboardMarkup::new(rows))
-}
-
-fn quick_add_keyboard(
-    items: &[(String, u64)],
-    revision: u64,
-    has_more: bool,
-) -> InlineKeyboardMarkup {
-    let mut rows = items
-        .iter()
-        .enumerate()
-        .map(|(index, (item, _))| {
-            vec![
-                InlineKeyboardButton::callback(
-                    "⚖️ Amount",
-                    format!("quickadd:{revision}:prefix:{index}"),
-                ),
-                InlineKeyboardButton::callback(
-                    item.clone(),
-                    format!("quickadd:{revision}:add:{index}"),
-                ),
-            ]
-        })
-        .collect::<Vec<_>>();
-    if has_more {
-        rows.push(vec![InlineKeyboardButton::callback(
-            format!("Next {QUICK_ADD_PAGE_SIZE}"),
-            format!("quickadd:{revision}:next"),
-        )]);
-    }
-    rows.push(vec![InlineKeyboardButton::callback(
-        "Done",
-        format!("quickadd:{revision}:done"),
-    )]);
-    InlineKeyboardMarkup::new(rows)
 }
 
 fn categories_keyboard(categories: &[Category]) -> InlineKeyboardMarkup {
@@ -773,44 +734,7 @@ async fn command_handler(
         }
 
         Command::Quickadd => {
-            let (candidates, has_more) = store.lock().await.quick_add_items(chat_id, 0).await?;
-            if candidates.is_empty() {
-                bot.send_message(
-                    chat_id,
-                    "No new items in your history are available to add.",
-                )
-                .await?;
-                return Ok(());
-            }
-
-            let dialog_generation = generation();
-            let revision = generation();
-            let message = bot
-                .send_message(
-                    chat_id,
-                    "Choose an item to add. Use Prefix to add a quantity or other prefix.",
-                )
-                .reply_markup(quick_add_keyboard(&candidates, revision, has_more))
-                .await?;
-            sessions.lock().await.insert(
-                chat_id.0,
-                Session::QuickAdd {
-                    message_id: message.id,
-                    generation: dialog_generation,
-                    revision,
-                    offset: 0,
-                    candidates: candidates.iter().map(|(item, _)| item.clone()).collect(),
-                    has_more,
-                    mode: QuickAddMode::Select,
-                },
-            );
-            tokio::spawn(expire_session(
-                bot.clone(),
-                sessions.clone(),
-                chat_id,
-                dialog_generation,
-                ADD_TIMEOUT,
-            ));
+            quick_add::start(&bot, &store, &sessions, chat_id).await?;
         }
 
         Command::Import => {
@@ -1112,29 +1036,11 @@ async fn text_handler(
             message_id,
             generation,
             offset,
-            mode: QuickAddMode::Prefix { item },
+            mode: quick_add::QuickAddMode::Prefix { item },
             ..
         }) => {
-            let prefix = text.trim();
-            if prefix.is_empty() {
-                bot.send_message(chat_id, "The prefix cannot be empty. Send a prefix:")
-                    .await?;
-                return Ok(());
-            }
-            store
-                .lock()
-                .await
-                .add_item(chat_id, format!("{prefix} {item}"))
-                .await?;
-            refresh_quick_add_view(
-                &bot,
-                &store,
-                &sessions,
-                chat_id,
-                message_id,
-                generation,
-                offset,
-                format!("Added {prefix} {item}. Choose another item:"),
+            quick_add::handle_prefix_text(
+                &bot, &store, &sessions, chat_id, message_id, generation, offset, item, text,
             )
             .await?;
         }
@@ -2343,234 +2249,6 @@ async fn category_callback(
     Ok(())
 }
 
-async fn refresh_quick_add_view(
-    bot: &Bot,
-    store: &SharedStore,
-    sessions: &SharedSessions,
-    chat_id: ChatId,
-    message_id: MessageId,
-    dialog_generation: u64,
-    offset: usize,
-    prompt: String,
-) -> Result<()> {
-    let mut offset = offset;
-    let (mut candidates, mut has_more) =
-        store.lock().await.quick_add_items(chat_id, offset).await?;
-    while candidates.is_empty() && offset > 0 {
-        offset = offset.saturating_sub(QUICK_ADD_PAGE_SIZE);
-        (candidates, has_more) = store.lock().await.quick_add_items(chat_id, offset).await?;
-    }
-    if candidates.is_empty() {
-        bot.edit_message_text(
-            chat_id,
-            message_id,
-            format!("{prompt}\n\nNo more items are available from your history."),
-        )
-        .reply_markup(InlineKeyboardMarkup::default())
-        .await?;
-        sessions.lock().await.remove(&chat_id.0);
-        return Ok(());
-    }
-
-    let revision = generation();
-    bot.edit_message_text(chat_id, message_id, prompt)
-        .reply_markup(quick_add_keyboard(&candidates, revision, has_more))
-        .await?;
-    sessions.lock().await.insert(
-        chat_id.0,
-        Session::QuickAdd {
-            message_id,
-            generation: dialog_generation,
-            revision,
-            offset,
-            candidates: candidates.iter().map(|(item, _)| item.clone()).collect(),
-            has_more,
-            mode: QuickAddMode::Select,
-        },
-    );
-    Ok(())
-}
-
-async fn quick_add_callback(
-    bot: Bot,
-    query_id: teloxide::types::CallbackQueryId,
-    data: &str,
-    chat_id: ChatId,
-    message_id: MessageId,
-    store: SharedStore,
-    sessions: SharedSessions,
-) -> Result<()> {
-    let Some((revision, action)) = data
-        .strip_prefix("quickadd:")
-        .and_then(|data| data.split_once(':'))
-        .and_then(|(revision, action)| {
-            revision
-                .parse::<u64>()
-                .ok()
-                .map(|revision| (revision, action))
-        })
-    else {
-        bot.answer_callback_query(query_id)
-            .text("Invalid quick-add action")
-            .await?;
-        return Ok(());
-    };
-
-    let session = sessions.lock().await.get(&chat_id.0).cloned();
-    let Some(Session::QuickAdd {
-        message_id: active_message_id,
-        generation: dialog_generation,
-        revision: active_revision,
-        offset,
-        candidates,
-        has_more,
-        mode,
-    }) = session
-    else {
-        bot.answer_callback_query(query_id)
-            .text("This operation has expired")
-            .await?;
-        return Ok(());
-    };
-    if active_message_id != message_id || active_revision != revision {
-        bot.answer_callback_query(query_id)
-            .text("This quick-add menu is out of date")
-            .await?;
-        return Ok(());
-    }
-
-    if action == "done" {
-        bot.answer_callback_query(query_id)
-            .text("Quick add finished")
-            .await?;
-        bot.edit_message_reply_markup(chat_id, message_id)
-            .reply_markup(InlineKeyboardMarkup::default())
-            .await?;
-        sessions.lock().await.remove(&chat_id.0);
-        return Ok(());
-    }
-
-    if action == "cancel" {
-        if !matches!(mode, QuickAddMode::Prefix { .. }) {
-            bot.answer_callback_query(query_id)
-                .text("This operation has expired")
-                .await?;
-            return Ok(());
-        }
-        bot.answer_callback_query(query_id).await?;
-        refresh_quick_add_view(
-            &bot,
-            &store,
-            &sessions,
-            chat_id,
-            message_id,
-            dialog_generation,
-            offset,
-            "Choose an item to add. Use Amount to add a quantity or other prefix.".to_string(),
-        )
-        .await?;
-        return Ok(());
-    }
-
-    if action == "next" {
-        if !matches!(mode, QuickAddMode::Select) {
-            bot.answer_callback_query(query_id)
-                .text("Finish entering the amount first")
-                .await?;
-            return Ok(());
-        }
-        if !has_more {
-            bot.answer_callback_query(query_id)
-                .text("No more items")
-                .await?;
-            return Ok(());
-        }
-        bot.answer_callback_query(query_id).await?;
-        refresh_quick_add_view(
-            &bot,
-            &store,
-            &sessions,
-            chat_id,
-            message_id,
-            dialog_generation,
-            offset.saturating_add(QUICK_ADD_PAGE_SIZE),
-            "Choose an item to add. Use Amount to add a quantity or other prefix.".to_string(),
-        )
-        .await?;
-        return Ok(());
-    }
-
-    let Some((action, index)) = action
-        .split_once(':')
-        .and_then(|(action, index)| index.parse::<usize>().ok().map(|index| (action, index)))
-    else {
-        bot.answer_callback_query(query_id)
-            .text("Invalid quick-add selection")
-            .await?;
-        return Ok(());
-    };
-    let Some(item) = candidates.get(index).cloned() else {
-        bot.answer_callback_query(query_id)
-            .text("This item is no longer available")
-            .await?;
-        return Ok(());
-    };
-
-    match action {
-        "add" if matches!(mode, QuickAddMode::Select) => {
-            store.lock().await.add_item(chat_id, item.clone()).await?;
-            bot.answer_callback_query(query_id)
-                .text(format!("Added {item}"))
-                .await?;
-            refresh_quick_add_view(
-                &bot,
-                &store,
-                &sessions,
-                chat_id,
-                message_id,
-                dialog_generation,
-                offset,
-                format!("Added {item}. Choose another item:"),
-            )
-            .await?;
-        }
-        "prefix" if matches!(mode, QuickAddMode::Select) => {
-            let revision = generation();
-            let markup = InlineKeyboardMarkup::new(vec![vec![InlineKeyboardButton::callback(
-                "Back to quick list",
-                format!("quickadd:{revision}:cancel"),
-            )]]);
-            bot.answer_callback_query(query_id).await?;
-            bot.edit_message_text(
-                chat_id,
-                message_id,
-                format!("Send a prefix to add before {item}, for example “2x” or “500g”."),
-            )
-            .reply_markup(markup)
-            .await?;
-            sessions.lock().await.insert(
-                chat_id.0,
-                Session::QuickAdd {
-                    message_id,
-                    generation: dialog_generation,
-                    revision,
-                    offset,
-                    candidates,
-                    has_more,
-                    mode: QuickAddMode::Prefix { item },
-                },
-            );
-        }
-        _ => {
-            bot.answer_callback_query(query_id)
-                .text("This operation has expired")
-                .await?;
-        }
-    }
-
-    Ok(())
-}
-
 async fn callback_handler(
     bot: Bot,
     query: CallbackQuery,
@@ -2588,7 +2266,7 @@ async fn callback_handler(
     };
 
     if data.starts_with("quickadd:") {
-        return quick_add_callback(bot, query.id, data, chat_id, message.id(), store, sessions)
+        return quick_add::callback(bot, query.id, data, chat_id, message.id(), store, sessions)
             .await;
     }
 
@@ -3271,9 +2949,10 @@ async fn main() -> Result<()> {
 mod tests {
     use crate::rstrip_slash;
 
-    use super::{Item, parse_import_list, plain_list_text, quick_add_keyboard};
+    use super::{Item, parse_import_list, plain_list_text};
 
     use crate::advanced::parse_history_categories;
+    use crate::quick_add::quick_add_keyboard;
     #[test]
     fn plain_list_export_has_no_header_and_can_exclude_checked_items() {
         let items = vec![
