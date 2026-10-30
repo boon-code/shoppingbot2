@@ -685,6 +685,39 @@ impl Store {
         Ok(items)
     }
 
+    pub async fn quick_add_items(&mut self, chat_id: ChatId) -> Result<Vec<(String, u64)>> {
+        self.load_history(chat_id).await?;
+        let current_items = self.items(chat_id).await?;
+        let existing = current_items
+            .iter()
+            .map(|item| normalize_history_text(&item.item))
+            .collect::<HashSet<_>>();
+        let mut candidates = self.history[&chat_id.0.to_string()]
+            .iter()
+            .filter(|entry| !existing.contains(&entry.text))
+            .map(|entry| {
+                let spelling = entry
+                    .spelling
+                    .iter()
+                    .flat_map(|spellings| spellings.iter())
+                    .max_by(|(left_name, left), (right_name, right)| {
+                        left.count
+                            .cmp(&right.count)
+                            .then_with(|| right_name.cmp(left_name))
+                    })
+                    .map(|(spelling, _)| spelling.clone())
+                    .unwrap_or_else(|| entry.text.clone());
+                (spelling, entry.text.clone(), entry.count)
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| right.2.cmp(&left.2).then_with(|| left.1.cmp(&right.1)));
+        Ok(candidates
+            .into_iter()
+            .take(30)
+            .map(|(spelling, _, count)| (spelling, count))
+            .collect())
+    }
+
     pub fn create_category(&self, chat_id: ChatId, name: &str) -> Result<Category> {
         let name = name.trim();
         if name.is_empty() {
@@ -2407,6 +2440,83 @@ mod tests {
             store.history_items(chat_id).await.unwrap(),
             vec![("milk".to_string(), 2), ("eggs".to_string(), 1)]
         );
+
+        store.shutdown().unwrap();
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn quick_add_returns_top_unlisted_history_spellings() {
+        let directory = test_directory("quick-add");
+        let chat_id = ChatId(1234);
+        let mut store = Store::load(&directory).await.unwrap();
+
+        store
+            .add_item(chat_id, "500ml MILK".to_string())
+            .await
+            .unwrap();
+        store.history.insert(
+            chat_id.0.to_string(),
+            vec![
+                HistoryEntry {
+                    text: "milk".to_string(),
+                    count: 4,
+                    spelling: vec![
+                        HashMap::from([("Milk".to_string(), HistorySpellingCount { count: 2 })]),
+                        HashMap::from([("MILK".to_string(), HistorySpellingCount { count: 1 })]),
+                        HashMap::from([("milk".to_string(), HistorySpellingCount { count: 1 })]),
+                    ],
+                },
+                HistoryEntry {
+                    text: "eggs".to_string(),
+                    count: 3,
+                    spelling: vec![HashMap::from([(
+                        "Eggs".to_string(),
+                        HistorySpellingCount { count: 2 },
+                    )])],
+                },
+                HistoryEntry {
+                    text: "bread".to_string(),
+                    count: 2,
+                    spelling: Vec::new(),
+                },
+            ],
+        );
+        let items = store.quick_add_items(chat_id).await.unwrap();
+        assert_eq!(
+            items,
+            vec![("Eggs".to_string(), 3), ("bread".to_string(), 2)]
+        );
+
+        store.add_item(chat_id, "Eggs".to_string()).await.unwrap();
+        assert_eq!(
+            store.quick_add_items(chat_id).await.unwrap(),
+            vec![("bread".to_string(), 2)]
+        );
+
+        store.shutdown().unwrap();
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn quick_add_limits_suggestions_to_thirty() {
+        let directory = test_directory("quick-add-limit");
+        let chat_id = ChatId(1234);
+        let mut store = Store::load(&directory).await.unwrap();
+        let history = (0..35)
+            .map(|index| HistoryEntry {
+                text: format!("item {index:02}"),
+                count: index + 1,
+                spelling: Vec::new(),
+            })
+            .collect();
+        store.history.insert(chat_id.0.to_string(), history);
+
+        let items = store.quick_add_items(chat_id).await.unwrap();
+        assert_eq!(items.len(), 30);
+        assert_eq!(items.first(), Some(&("item 34".to_string(), 35)));
 
         store.shutdown().unwrap();
         drop(store);
