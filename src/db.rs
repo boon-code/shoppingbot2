@@ -685,7 +685,11 @@ impl Store {
         Ok(items)
     }
 
-    pub async fn quick_add_items(&mut self, chat_id: ChatId) -> Result<Vec<(String, u64)>> {
+    pub async fn quick_add_items(
+        &mut self,
+        chat_id: ChatId,
+        offset: usize,
+    ) -> Result<(Vec<(String, u64)>, bool)> {
         self.load_history(chat_id).await?;
         let current_items = self.items(chat_id).await?;
         let existing = current_items
@@ -711,11 +715,16 @@ impl Store {
             })
             .collect::<Vec<_>>();
         candidates.sort_by(|left, right| right.2.cmp(&left.2).then_with(|| left.1.cmp(&right.1)));
-        Ok(candidates
-            .into_iter()
-            .take(30)
-            .map(|(spelling, _, count)| (spelling, count))
-            .collect())
+        let has_more = candidates.len() > offset.saturating_add(30);
+        Ok((
+            candidates
+                .into_iter()
+                .skip(offset)
+                .take(30)
+                .map(|(spelling, _, count)| (spelling, count))
+                .collect(),
+            has_more,
+        ))
     }
 
     pub fn create_category(&self, chat_id: ChatId, name: &str) -> Result<Category> {
@@ -2483,7 +2492,8 @@ mod tests {
                 },
             ],
         );
-        let items = store.quick_add_items(chat_id).await.unwrap();
+        let (items, has_more) = store.quick_add_items(chat_id, 0).await.unwrap();
+        assert!(!has_more);
         assert_eq!(
             items,
             vec![("Eggs".to_string(), 3), ("bread".to_string(), 2)]
@@ -2491,8 +2501,8 @@ mod tests {
 
         store.add_item(chat_id, "Eggs".to_string()).await.unwrap();
         assert_eq!(
-            store.quick_add_items(chat_id).await.unwrap(),
-            vec![("bread".to_string(), 2)]
+            store.quick_add_items(chat_id, 0).await.unwrap(),
+            (vec![("bread".to_string(), 2)], false)
         );
 
         store.shutdown().unwrap();
@@ -2514,9 +2524,13 @@ mod tests {
             .collect();
         store.history.insert(chat_id.0.to_string(), history);
 
-        let items = store.quick_add_items(chat_id).await.unwrap();
+        let (items, has_more) = store.quick_add_items(chat_id, 0).await.unwrap();
         assert_eq!(items.len(), 30);
         assert_eq!(items.first(), Some(&("item 34".to_string(), 35)));
+        assert!(has_more);
+        let (next_page, has_more) = store.quick_add_items(chat_id, 30).await.unwrap();
+        assert_eq!(next_page.len(), 5);
+        assert!(!has_more);
 
         store.shutdown().unwrap();
         drop(store);

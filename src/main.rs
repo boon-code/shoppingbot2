@@ -120,7 +120,9 @@ enum Session {
         message_id: MessageId,
         generation: u64,
         revision: u64,
+        offset: usize,
         candidates: Vec<String>,
+        has_more: bool,
         mode: QuickAddMode,
     },
 
@@ -328,7 +330,12 @@ fn revive_keyboard(items: &[Item]) -> Option<InlineKeyboardMarkup> {
     Some(InlineKeyboardMarkup::new(rows))
 }
 
-fn quick_add_keyboard(items: &[(String, u64)], revision: u64) -> InlineKeyboardMarkup {
+fn quick_add_keyboard(
+    items: &[(String, u64)],
+    revision: u64,
+    offset: usize,
+    has_more: bool,
+) -> InlineKeyboardMarkup {
     let mut rows = items
         .iter()
         .enumerate()
@@ -345,6 +352,22 @@ fn quick_add_keyboard(items: &[(String, u64)], revision: u64) -> InlineKeyboardM
             ]
         })
         .collect::<Vec<_>>();
+    if offset > 0 || has_more {
+        let mut navigation = Vec::new();
+        if offset > 0 {
+            navigation.push(InlineKeyboardButton::callback(
+                "Previous 30",
+                format!("quickadd:{revision}:previous"),
+            ));
+        }
+        if has_more {
+            navigation.push(InlineKeyboardButton::callback(
+                "Next 30",
+                format!("quickadd:{revision}:next"),
+            ));
+        }
+        rows.push(navigation);
+    }
     rows.push(vec![InlineKeyboardButton::callback(
         "Done",
         format!("quickadd:{revision}:done"),
@@ -833,7 +856,7 @@ async fn command_handler(
         }
 
         Command::Quickadd => {
-            let candidates = store.lock().await.quick_add_items(chat_id).await?;
+            let (candidates, has_more) = store.lock().await.quick_add_items(chat_id, 0).await?;
             if candidates.is_empty() {
                 bot.send_message(
                     chat_id,
@@ -850,7 +873,7 @@ async fn command_handler(
                     chat_id,
                     "Choose an item to add. Use Prefix to add a quantity or other prefix.",
                 )
-                .reply_markup(quick_add_keyboard(&candidates, revision))
+                .reply_markup(quick_add_keyboard(&candidates, revision, 0, has_more))
                 .await?;
             sessions.lock().await.insert(
                 chat_id.0,
@@ -858,7 +881,9 @@ async fn command_handler(
                     message_id: message.id,
                     generation: dialog_generation,
                     revision,
+                    offset: 0,
                     candidates: candidates.iter().map(|(item, _)| item.clone()).collect(),
+                    has_more,
                     mode: QuickAddMode::Select,
                 },
             );
@@ -1281,6 +1306,7 @@ async fn text_handler(
         Some(Session::QuickAdd {
             message_id,
             generation,
+            offset,
             mode: QuickAddMode::Prefix { item },
             ..
         }) => {
@@ -1302,6 +1328,7 @@ async fn text_handler(
                 chat_id,
                 message_id,
                 generation,
+                offset,
                 format!("Added {prefix} {item}. Choose another item:"),
             )
             .await?;
@@ -2756,9 +2783,16 @@ async fn refresh_quick_add_view(
     chat_id: ChatId,
     message_id: MessageId,
     dialog_generation: u64,
+    offset: usize,
     prompt: String,
 ) -> Result<()> {
-    let candidates = store.lock().await.quick_add_items(chat_id).await?;
+    let mut offset = offset;
+    let (mut candidates, mut has_more) =
+        store.lock().await.quick_add_items(chat_id, offset).await?;
+    while candidates.is_empty() && offset > 0 {
+        offset = offset.saturating_sub(30);
+        (candidates, has_more) = store.lock().await.quick_add_items(chat_id, offset).await?;
+    }
     if candidates.is_empty() {
         bot.edit_message_text(
             chat_id,
@@ -2773,7 +2807,7 @@ async fn refresh_quick_add_view(
 
     let revision = generation();
     bot.edit_message_text(chat_id, message_id, prompt)
-        .reply_markup(quick_add_keyboard(&candidates, revision))
+        .reply_markup(quick_add_keyboard(&candidates, revision, offset, has_more))
         .await?;
     sessions.lock().await.insert(
         chat_id.0,
@@ -2781,7 +2815,9 @@ async fn refresh_quick_add_view(
             message_id,
             generation: dialog_generation,
             revision,
+            offset,
             candidates: candidates.iter().map(|(item, _)| item.clone()).collect(),
+            has_more,
             mode: QuickAddMode::Select,
         },
     );
@@ -2818,7 +2854,9 @@ async fn quick_add_callback(
         message_id: active_message_id,
         generation: dialog_generation,
         revision: active_revision,
+        offset,
         candidates,
+        has_more,
         mode,
     }) = session
     else {
@@ -2860,7 +2898,40 @@ async fn quick_add_callback(
             chat_id,
             message_id,
             dialog_generation,
-            "Choose an item to add. Use Prefix to add a quantity or other prefix.".to_string(),
+            offset,
+            "Choose an item to add. Use Amount to add a quantity or other prefix.".to_string(),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    if action == "next" || action == "previous" {
+        if !matches!(mode, QuickAddMode::Select) {
+            bot.answer_callback_query(query_id)
+                .text("Finish entering the amount first")
+                .await?;
+            return Ok(());
+        }
+        let next_offset = match action {
+            "next" if has_more => offset.saturating_add(30),
+            "previous" if offset > 0 => offset.saturating_sub(30),
+            _ => {
+                bot.answer_callback_query(query_id)
+                    .text("No more items in that direction")
+                    .await?;
+                return Ok(());
+            }
+        };
+        bot.answer_callback_query(query_id).await?;
+        refresh_quick_add_view(
+            &bot,
+            &store,
+            &sessions,
+            chat_id,
+            message_id,
+            dialog_generation,
+            next_offset,
+            "Choose an item to add. Use Amount to add a quantity or other prefix.".to_string(),
         )
         .await?;
         return Ok(());
@@ -2895,6 +2966,7 @@ async fn quick_add_callback(
                 chat_id,
                 message_id,
                 dialog_generation,
+                offset,
                 format!("Added {item}. Choose another item:"),
             )
             .await?;
@@ -2919,7 +2991,9 @@ async fn quick_add_callback(
                     message_id,
                     generation: dialog_generation,
                     revision,
+                    offset,
                     candidates,
+                    has_more,
                     mode: QuickAddMode::Prefix { item },
                 },
             );
@@ -3634,7 +3708,9 @@ async fn main() -> Result<()> {
 mod tests {
     use crate::rstrip_slash;
 
-    use super::{Item, parse_history_categories, parse_import_list, plain_list_text};
+    use super::{
+        Item, parse_history_categories, parse_import_list, plain_list_text, quick_add_keyboard,
+    };
 
     #[test]
     fn plain_list_export_has_no_header_and_can_exclude_checked_items() {
@@ -3815,6 +3891,27 @@ mod tests {
         assert_eq!(rows[1][0]["text"].as_str(), Some("DONE"));
         assert_eq!(rows[1][0]["callback_data"].as_str(), Some("revive:done"));
         assert!(super::revive_keyboard(&items[..1]).is_none());
+    }
+
+    #[test]
+    fn quick_add_keyboard_shows_pagination_for_available_pages() {
+        let items = vec![("Milk".to_string(), 3)];
+        let first_page = serde_json::to_value(quick_add_keyboard(&items, 7, 0, true)).unwrap();
+        let first_rows = first_page["inline_keyboard"].as_array().unwrap();
+        assert_eq!(first_rows[0][0]["text"].as_str(), Some("⚖️ Amount"));
+        assert_eq!(first_rows[1][0]["text"].as_str(), Some("Next 30"));
+        assert_eq!(
+            first_rows[1][0]["callback_data"].as_str(),
+            Some("quickadd:7:next")
+        );
+
+        let later_page = serde_json::to_value(quick_add_keyboard(&items, 8, 30, false)).unwrap();
+        let later_rows = later_page["inline_keyboard"].as_array().unwrap();
+        assert_eq!(later_rows[1][0]["text"].as_str(), Some("Previous 30"));
+        assert_eq!(
+            later_rows[1][0]["callback_data"].as_str(),
+            Some("quickadd:8:previous")
+        );
     }
 
     #[test]
