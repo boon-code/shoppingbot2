@@ -26,6 +26,7 @@ use tokio::{fs, sync::Mutex, time::sleep};
 
 mod db;
 
+const QUICK_ADD_PAGE_SIZE: usize = 30;
 const ADD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const SHOP_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 const SWAP_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -333,7 +334,6 @@ fn revive_keyboard(items: &[Item]) -> Option<InlineKeyboardMarkup> {
 fn quick_add_keyboard(
     items: &[(String, u64)],
     revision: u64,
-    offset: usize,
     has_more: bool,
 ) -> InlineKeyboardMarkup {
     let mut rows = items
@@ -352,21 +352,11 @@ fn quick_add_keyboard(
             ]
         })
         .collect::<Vec<_>>();
-    if offset > 0 || has_more {
-        let mut navigation = Vec::new();
-        if offset > 0 {
-            navigation.push(InlineKeyboardButton::callback(
-                "Previous 30",
-                format!("quickadd:{revision}:previous"),
-            ));
-        }
-        if has_more {
-            navigation.push(InlineKeyboardButton::callback(
-                "Next 30",
-                format!("quickadd:{revision}:next"),
-            ));
-        }
-        rows.push(navigation);
+    if has_more {
+        rows.push(vec![InlineKeyboardButton::callback(
+            format!("Next {QUICK_ADD_PAGE_SIZE}"),
+            format!("quickadd:{revision}:next"),
+        )]);
     }
     rows.push(vec![InlineKeyboardButton::callback(
         "Done",
@@ -873,7 +863,7 @@ async fn command_handler(
                     chat_id,
                     "Choose an item to add. Use Prefix to add a quantity or other prefix.",
                 )
-                .reply_markup(quick_add_keyboard(&candidates, revision, 0, has_more))
+                .reply_markup(quick_add_keyboard(&candidates, revision, has_more))
                 .await?;
             sessions.lock().await.insert(
                 chat_id.0,
@@ -2790,7 +2780,7 @@ async fn refresh_quick_add_view(
     let (mut candidates, mut has_more) =
         store.lock().await.quick_add_items(chat_id, offset).await?;
     while candidates.is_empty() && offset > 0 {
-        offset = offset.saturating_sub(30);
+        offset = offset.saturating_sub(QUICK_ADD_PAGE_SIZE);
         (candidates, has_more) = store.lock().await.quick_add_items(chat_id, offset).await?;
     }
     if candidates.is_empty() {
@@ -2807,7 +2797,7 @@ async fn refresh_quick_add_view(
 
     let revision = generation();
     bot.edit_message_text(chat_id, message_id, prompt)
-        .reply_markup(quick_add_keyboard(&candidates, revision, offset, has_more))
+        .reply_markup(quick_add_keyboard(&candidates, revision, has_more))
         .await?;
     sessions.lock().await.insert(
         chat_id.0,
@@ -2905,23 +2895,19 @@ async fn quick_add_callback(
         return Ok(());
     }
 
-    if action == "next" || action == "previous" {
+    if action == "next" {
         if !matches!(mode, QuickAddMode::Select) {
             bot.answer_callback_query(query_id)
                 .text("Finish entering the amount first")
                 .await?;
             return Ok(());
         }
-        let next_offset = match action {
-            "next" if has_more => offset.saturating_add(30),
-            "previous" if offset > 0 => offset.saturating_sub(30),
-            _ => {
-                bot.answer_callback_query(query_id)
-                    .text("No more items in that direction")
-                    .await?;
-                return Ok(());
-            }
-        };
+        if !has_more {
+            bot.answer_callback_query(query_id)
+                .text("No more items")
+                .await?;
+            return Ok(());
+        }
         bot.answer_callback_query(query_id).await?;
         refresh_quick_add_view(
             &bot,
@@ -2930,7 +2916,7 @@ async fn quick_add_callback(
             chat_id,
             message_id,
             dialog_generation,
-            next_offset,
+            offset.saturating_add(QUICK_ADD_PAGE_SIZE),
             "Choose an item to add. Use Amount to add a quantity or other prefix.".to_string(),
         )
         .await?;
@@ -3896,22 +3882,22 @@ mod tests {
     #[test]
     fn quick_add_keyboard_shows_pagination_for_available_pages() {
         let items = vec![("Milk".to_string(), 3)];
-        let first_page = serde_json::to_value(quick_add_keyboard(&items, 7, 0, true)).unwrap();
+        let first_page = serde_json::to_value(quick_add_keyboard(&items, 7, true)).unwrap();
         let first_rows = first_page["inline_keyboard"].as_array().unwrap();
         assert_eq!(first_rows[0][0]["text"].as_str(), Some("⚖️ Amount"));
-        assert_eq!(first_rows[1][0]["text"].as_str(), Some("Next 30"));
+        assert_eq!(
+            first_rows[1][0]["text"].as_str(),
+            Some(format!("Next {}", super::QUICK_ADD_PAGE_SIZE).as_str())
+        );
         assert_eq!(
             first_rows[1][0]["callback_data"].as_str(),
             Some("quickadd:7:next")
         );
 
-        let later_page = serde_json::to_value(quick_add_keyboard(&items, 8, 30, false)).unwrap();
+        let later_page = serde_json::to_value(quick_add_keyboard(&items, 8, false)).unwrap();
         let later_rows = later_page["inline_keyboard"].as_array().unwrap();
-        assert_eq!(later_rows[1][0]["text"].as_str(), Some("Previous 30"));
-        assert_eq!(
-            later_rows[1][0]["callback_data"].as_str(),
-            Some("quickadd:8:previous")
-        );
+        assert_eq!(later_rows.len(), 2);
+        assert_eq!(later_rows[1][0]["text"].as_str(), Some("Done"));
     }
 
     #[test]

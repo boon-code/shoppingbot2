@@ -715,12 +715,12 @@ impl Store {
             })
             .collect::<Vec<_>>();
         candidates.sort_by(|left, right| right.2.cmp(&left.2).then_with(|| left.1.cmp(&right.1)));
-        let has_more = candidates.len() > offset.saturating_add(30);
+        let has_more = candidates.len() > offset.saturating_add(super::QUICK_ADD_PAGE_SIZE);
         Ok((
             candidates
                 .into_iter()
                 .skip(offset)
-                .take(30)
+                .take(super::QUICK_ADD_PAGE_SIZE)
                 .map(|(spelling, _, count)| (spelling, count))
                 .collect(),
             has_more,
@@ -2515,20 +2515,29 @@ mod tests {
         let directory = test_directory("quick-add-limit");
         let chat_id = ChatId(1234);
         let mut store = Store::load(&directory).await.unwrap();
-        let history = (0..35)
+        let history = (0..super::super::QUICK_ADD_PAGE_SIZE + 5)
             .map(|index| HistoryEntry {
                 text: format!("item {index:02}"),
-                count: index + 1,
+                count: index as u64 + 1,
                 spelling: Vec::new(),
             })
             .collect();
         store.history.insert(chat_id.0.to_string(), history);
 
         let (items, has_more) = store.quick_add_items(chat_id, 0).await.unwrap();
-        assert_eq!(items.len(), 30);
-        assert_eq!(items.first(), Some(&("item 34".to_string(), 35)));
+        assert_eq!(items.len(), super::super::QUICK_ADD_PAGE_SIZE);
+        assert_eq!(
+            items.first(),
+            Some(&(
+                format!("item {:02}", super::super::QUICK_ADD_PAGE_SIZE + 4),
+                (super::super::QUICK_ADD_PAGE_SIZE + 5) as u64
+            ))
+        );
         assert!(has_more);
-        let (next_page, has_more) = store.quick_add_items(chat_id, 30).await.unwrap();
+        let (next_page, has_more) = store
+            .quick_add_items(chat_id, super::super::QUICK_ADD_PAGE_SIZE)
+            .await
+            .unwrap();
         assert_eq!(next_page.len(), 5);
         assert!(!has_more);
 
