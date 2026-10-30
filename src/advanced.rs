@@ -8,7 +8,8 @@ use teloxide::{
     },
 };
 
-use crate::{AdvancedMode, Session, SharedSessions, SharedStore, plain_list_text};
+use crate::presentation::plain_list_text;
+use crate::{AdvancedMode, Session, SharedSessions, SharedStore};
 
 pub(crate) async fn handle_document(
     bot: &Bot,
